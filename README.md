@@ -1,4 +1,4 @@
 # durable-go
-Durable task execution for Go — memoized steps with pluggable persistence (SQLite and more).
+Durable task execution for Go with memoized steps and pluggable persistence.
 
-durable-go is a small Go library for durable task execution. Define typed tasks, run memoized steps through a StepRunner, and persist task/step state via a pluggable Store (including SQLite). Aimed at building restart-safe, agentic, and long-running workflows without a heavy orchestration framework.
+durable-go is a Go library for durable task execution. Define typed tasks, run memoized steps, and persist progress so work can resume safely after failures or restarts. Useful for any Go app that needs reliable, resumable workflows without a heavy orchestration framework.
