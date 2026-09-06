@@ -6,22 +6,28 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/agenticenv/durable-go.svg)](https://pkg.go.dev/github.com/agenticenv/durable-go)
 [![License](https://img.shields.io/github/license/agenticenv/durable-go?label=License)](LICENSE)
 
-**Durable task execution for Go with memoized steps and pluggable persistence.**
+**Lightweight, embeddable durable task execution for Go — no external infra required.**
 
-**durable-go** is a Go library for durable task execution. Define typed tasks, run memoized steps, and persist progress so work can resume safely after failures or restarts. Useful for any Go app that needs reliable, resumable workflows without a heavy orchestration framework.
+**durable-go** lets you define typed tasks, run memoized steps, and persist progress so work can resume safely after failures or restarts. Useful for any Go app that needs reliable, resumable workflows without a heavy orchestration framework.
 
 > Releases follow [Semantic Versioning](https://semver.org/); see the [latest release](https://github.com/agenticenv/durable-go/releases/latest).
 
 ## Features
 
-- **Typed tasks** — generic `Run` / `Task` with input and output types
-- **Memoized steps** — completed steps replay from the store; they are not run again
-- **In-process** — no cluster or workflow server; one process, one store
-- **Pluggable persistence** — `Store` interface; SQLite driver included
-- **Timeouts and retries** — `WithTimeout`, `WithMaxRetries` on the task handle
-- **Panic recovery** — task and step panics are recorded and returned as errors
-- **Auto-purge** — optional background cleanup of old completed and failed records
-- **Closure or struct** — `durable.Func` for inline tasks, or a type with `Exec`
+- **Typed tasks** — generic `Run` / `Task` with input and output types.
+- **Memoized steps** — completed steps replay from the store; they are not run again.
+- **In-process** — no cluster or workflow server; one process, one store.
+- **Pluggable persistence** — `Store` interface; SQLite driver included.
+- **Timeouts and retries** — `WithTimeout`, `WithMaxRetries` on the task handle.
+- **Panic recovery** — task and step panics are recorded and returned as errors.
+- **Auto-purge** — optional background cleanup of old completed and failed records.
+- **Flexible execution** — tasks as `durable.Func` closures or structs with `Exec`.
+
+## Why durable-go
+
+Most durable-execution tools (Temporal, DBOS) require running external infrastructure — a workflow server, a Postgres database — and impose constraints on your code (deterministic replay, no direct time/random calls).
+
+durable-go is different: one process, a pluggable store (SQLite included), no workflow server. On resume the task function runs again, but completed steps return their cached result and are not re-executed. Put side effects inside `Step`; there is no deterministic-replay sandbox.
 
 ## Install
 
@@ -67,6 +73,27 @@ _ = out
 ```
 
 Re-running the same task identity replays completed steps from the store.
+
+### Struct-based tasks
+
+For services with injected dependencies, implement `Exec` on a struct and pass it to `Run`:
+
+```go
+type Job struct {
+    DB    *Database
+    Mail  Mailer
+}
+
+func (j *Job) Exec(ctx context.Context, s *durable.StepRunner, id string) (string, error) {
+    return durable.Step(ctx, s, "notify", func(ctx context.Context) (string, error) {
+        return j.Mail.Send(ctx, id)
+    })
+}
+
+out, _ := durable.Run(ctx, handle, "42", &Job{DB: db, Mail: mailer})
+```
+
+Full example: [`examples/agent/`](examples/agent/).
 
 ## Examples
 
