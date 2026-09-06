@@ -72,7 +72,7 @@ out, _ := durable.Run(context.Background(), handle, "hello", durable.Func(
 _ = out
 ```
 
-Re-running the same task identity replays completed steps from the store.
+Full example: [`examples/payment/`](examples/payment/).
 
 ### Struct-based tasks
 
@@ -94,6 +94,12 @@ out, _ := durable.Run(ctx, handle, "42", &Job{DB: db, Mail: mailer})
 ```
 
 Full example: [`examples/agent/`](examples/agent/).
+
+## Resume
+
+Call `Run` again with the same `NewTask` ID and the same input. Completed steps replay from the store. After a crash, leftover records show as `StatusRunning` in `ListTasks`; you still call `Run` — the library does not auto-resume.
+
+Full example: [`examples/resume/`](examples/resume/).
 
 ## Writing tasks
 
