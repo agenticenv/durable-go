@@ -32,5 +32,5 @@ go run .
 ## Reset
 
 ```bash
-rm examples/resume/.data/resume-demo.db
+rm -rf examples/resume/.data/
 ```

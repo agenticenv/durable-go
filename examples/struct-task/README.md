@@ -1,10 +1,11 @@
-# Agent Example — Struct / Method Receiver Style
+# struct-task — Struct / Method Receiver Style
 
-Demonstrates `AgentRunner`, a struct with injected dependencies (`OpenAIClient`, `Database`)
+Demonstrates a struct with injected dependencies (`OpenAIClient`, `Database`)
 that implements `durable.Task` directly via an `Exec` method.
 
-This is the idiomatic pattern for production services and local AI agents where
-dependencies are constructed once and reused across task runs.
+Idiomatic pattern for production services where dependencies are constructed once
+and reused across task runs. Also shows `WithTimeout`, `WithMaxRetries`, `WithTag`,
+and `WithAutoPurge`.
 
 ## Run
 
@@ -15,5 +16,5 @@ go run .
 ## Reset
 
 ```bash
-rm examples/agent/.data/agent.db
+rm -rf examples/struct-task/.data/
 ```
