@@ -17,7 +17,7 @@
 - **Typed tasks** — generic `Run` / `Task` with input and output types.
 - **Memoized steps** — completed steps replay from the store; they are not run again.
 - **In-process** — no cluster or workflow server; one process, one store.
-- **Pluggable persistence** — `Store` interface; journal-per-task filesystem store included (zero external dependencies).
+- **Pluggable persistence** — `Store` interface; journal-per-task filesystem store included.
 - **Timeouts and retries** — `WithTimeout`, `WithMaxRetries` on the task handle.
 - **Panic recovery** — task and step panics are recorded and returned as errors.
 - **Auto-purge** — optional background cleanup of old completed and failed records.
