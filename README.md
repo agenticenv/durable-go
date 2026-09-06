@@ -95,6 +95,20 @@ out, _ := durable.Run(ctx, handle, "42", &Job{DB: db, Mail: mailer})
 
 Full example: [`examples/agent/`](examples/agent/).
 
+## Writing tasks
+
+Follow these when you write a task. On resume, the task runs again from the top; completed steps are reused, not re-executed.
+
+1. **Side effects in `Step`.** Do not call an API, write to a database, or publish to a queue in the task body. Wrap that work in `durable.Step`.
+2. **Non-deterministic values in `Step`.** Do not use `time.Now()`, UUIDs, or random values in the task body to choose a step ID or a branch. Generate them inside a `Step` so resume sees the same result.
+3. **Idempotent steps.** A crash can re-run a step after the side effect already happened. Charging a card or sending mail must be safe to do twice (or no-op).
+
+Also:
+
+- **Unique step IDs** — one stable string per step (literals or deterministic keys). Reusing an ID returns the first completed result.
+- **JSON results** — step outputs must be JSON-marshalable.
+- **Same task ID to resume** — task inputs are not persisted; pass the same input to `Run` when resuming. Do not call `Run` concurrently for the same ID.
+
 ## Examples
 
 Runnable examples in [examples/](examples/) — see [examples/README.md](examples/README.md) for setup and run instructions.
