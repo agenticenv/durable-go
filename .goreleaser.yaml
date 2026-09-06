@@ -15,7 +15,7 @@ release:
   header: |
     ## durable-go
 
-    Single-node durable task execution for Go.
+    Lightweight, embeddable durable task execution for Go — no external infra required.
 
     ### Install
 
