@@ -25,9 +25,10 @@
 
 ## Why durable-go
 
-Most durable-execution tools (Temporal, DBOS) require running external infrastructure — a workflow server, a Postgres database — and impose constraints on your code (deterministic replay, no direct time/random calls).
+Most durable-execution frameworks require external infrastructure—such as a dedicated workflow server or a Postgres database—and enforce strict code execution models like replay determinism.
 
-durable-go is different: one process, a pluggable store (SQLite included), no workflow server. On resume the task function runs again, but completed steps return their cached result and are not re-executed. Put side effects inside `Step`; there is no deterministic-replay sandbox.
+`durable-go` takes a zero-infra, in-process approach: a single Go library with an embedded store (like SQLite) running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results in your store. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox.
+
 
 ## Install
 
