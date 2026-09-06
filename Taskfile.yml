@@ -1,0 +1,169 @@
+version: '3'
+
+silent: true
+
+vars:
+  # Prefer the explicit `toolchain goX.Y.Z` line; fall back to the `go X.Y` line.
+  # Required for coverage tasks — the bare language version is not a valid toolchain name.
+  GO_TOOLCHAIN:
+    sh: |
+      tc=$(awk '/^toolchain / { print $2; exit }' go.mod)
+      if [ -z "$tc" ]; then
+        tc=$(awk '/^go / { print "go" $2; exit }' go.mod)
+      fi
+      echo "$tc"
+  GOTOOLCHAIN_COVERAGE: '{{.GO_TOOLCHAIN}}+auto'
+
+tasks:
+  # ── Default ──────────────────────────────────────────────────────────────
+
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  # ── Build ─────────────────────────────────────────────────────────────────
+
+  build:
+    desc: Compile all packages (core + store/sqlite + examples)
+    cmds:
+      - echo "==> Building durable-go..."
+      - go build ./...
+      - echo "==> Build complete"
+
+  # ── Test ──────────────────────────────────────────────────────────────────
+
+  test:
+    desc: Run all tests
+    cmds:
+      - echo "==> Running tests..."
+      - go test ./... -count=1
+      - echo "==> Tests complete"
+
+  test-coverage:
+    desc: Run tests with coverage; writes coverage.out and coverage.html
+    env:
+      GOTOOLCHAIN: '{{.GOTOOLCHAIN_COVERAGE}}'
+    cmds:
+      - echo "==> Running tests with coverage..."
+      - go test $(go list ./... | grep -v '/examples/') -count=1 -coverprofile=coverage.out
+      - echo "==> Total coverage:"
+      - go tool cover -func=coverage.out | grep '^total:'
+      - go tool cover -html=coverage.out -o coverage.html
+      - 'echo "==> Coverage report: coverage.html"'
+
+  # ── Format ────────────────────────────────────────────────────────────────
+
+  fmt:
+    desc: Format all Go files (gofmt -s -w)
+    cmds:
+      - echo "==> gofmt -s -w"
+      - gofmt -s -w .
+      - echo "==> Format complete"
+
+  fmt-check:
+    desc: Fail if any Go file needs gofmt -s (run `task fmt` to fix)
+    cmds:
+      - |
+        echo "==> Checking gofmt -s..."
+        files=$(gofmt -s -l .)
+        if [ -n "$files" ]; then
+          echo "These files are not gofmt -s formatted. Run: task fmt"
+          echo "$files"
+          exit 1
+        fi
+        echo "==> gofmt -s OK"
+
+  # ── Spell-check ───────────────────────────────────────────────────────────
+
+  spell:
+    desc: Spell-check tracked source files (skips gitignored paths)
+    cmds:
+      - |
+        echo "==> misspell"
+        files=$(git ls-files -z -- '*.go' '*.md' '*.yaml' '*.yml')
+        if [ -z "$files" ]; then
+          echo "No files to spell-check"
+        else
+          printf '%s' "$files" | xargs -0 go run github.com/client9/misspell/cmd/misspell@latest -error
+        fi
+
+  # ── Lint ──────────────────────────────────────────────────────────────────
+
+  lint:
+    desc: Run all linters (fmt-check, spell, go vet, golangci-lint)
+    cmds:
+      - task: fmt-check
+      - task: spell
+      - echo "==> go vet..."
+      - go vet ./...
+      - echo "==> golangci-lint..."
+      - golangci-lint run ./...
+      - echo "==> Lint complete"
+
+  # ── Module maintenance ────────────────────────────────────────────────────
+
+  tidy:
+    desc: Tidy module dependencies (go mod tidy)
+    cmds:
+      - echo "==> Tidying module dependencies..."
+      - go mod tidy
+      - echo "==> Tidy complete"
+
+  # ── Clean ─────────────────────────────────────────────────────────────────
+
+  clean:
+    desc: Remove coverage artifacts and any SQLite test/example databases
+    cmds:
+      - echo "==> Cleaning..."
+      - rm -f coverage.out coverage.html
+      - find . -name '*.db' -not -path '*/\.*' -delete
+      - echo "==> Clean complete"
+
+  # ── Security ──────────────────────────────────────────────────────────────
+
+  secrets-scan:
+    desc: Scan tracked files for leaked secrets (gitleaks)
+    cmds:
+      - |
+        echo "==> gitleaks detect"
+        if command -v gitleaks >/dev/null 2>&1; then
+          gitleaks detect --source . --verbose --redact
+        elif command -v docker >/dev/null 2>&1; then
+          docker run --rm -v "$(pwd):/repo" -w /repo zricethezav/gitleaks:latest detect --source=/repo --verbose --redact
+        else
+          echo "Install gitleaks or Docker to run secrets-scan."
+          exit 1
+        fi
+
+  govuln:
+    desc: Run govulncheck against all packages
+    cmds:
+      - |
+        echo "==> govulncheck"
+        if ! command -v govulncheck >/dev/null 2>&1; then
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+        fi
+        tc=$(awk '/^toolchain / { print $2; exit }' go.mod)
+        if [ -z "$tc" ]; then
+          tc=$(awk '/^go / { print "go" $2; exit }' go.mod)
+        fi
+        echo "==> GOTOOLCHAIN=$tc"
+        GOTOOLCHAIN="$tc" govulncheck ./...
+        echo "==> govulncheck complete"
+
+  # ── All-in-one gate (run before push) ────────────────────────────────────
+  #
+  # Mirrors CI: lint → test → build → secrets-scan → govuln
+  # test-coverage is omitted (run it separately when you need the HTML report).
+  # If fmt-check fails, run `task fmt` first.
+
+  check:
+    desc: All CI/security gates locally (lint, test, build, secrets-scan, govuln)
+    cmds:
+      - task: lint
+      - task: test
+      - task: build
+      - task: secrets-scan
+      - task: govuln
+      - echo "==> All checks passed (ready to push)"

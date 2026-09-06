@@ -1,0 +1,15 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        target: 40%
+        threshold: 5%
+
+# Paths excluded from coverage reports.
+ignore:
+  - "examples/**"
+  - "**/*_test.go"
