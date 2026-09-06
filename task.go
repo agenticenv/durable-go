@@ -44,6 +44,7 @@ type TaskHandle struct {
 	cfg    taskConfig
 	store  Store
 	logger *slog.Logger
+	client *Client // back-reference for per-task mutex in Run
 }
 
 // ID returns the unique task identifier associated with this handle.
@@ -57,7 +58,7 @@ func (c *Client) NewTask(id string, opts ...TaskOption) *TaskHandle {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &TaskHandle{cfg: cfg, store: c.store, logger: c.cfg.logger}
+	return &TaskHandle{cfg: cfg, store: c.store, logger: c.cfg.logger, client: c}
 }
 
 // Task is the execution contract for a durable task.

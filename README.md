@@ -17,7 +17,7 @@
 - **Typed tasks** — generic `Run` / `Task` with input and output types.
 - **Memoized steps** — completed steps replay from the store; they are not run again.
 - **In-process** — no cluster or workflow server; one process, one store.
-- **Pluggable persistence** — `Store` interface; SQLite driver included.
+- **Pluggable persistence** — `Store` interface; journal-per-task filesystem store included (zero external dependencies).
 - **Timeouts and retries** — `WithTimeout`, `WithMaxRetries` on the task handle.
 - **Panic recovery** — task and step panics are recorded and returned as errors.
 - **Auto-purge** — optional background cleanup of old completed and failed records.
@@ -27,8 +27,9 @@
 
 Most durable-execution frameworks require external infrastructure—such as a dedicated workflow server or a Postgres database—and enforce strict code execution models like replay determinism.
 
-`durable-go` takes a zero-infra, in-process approach: a single Go library with an embedded store (like SQLite) running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results in your store. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox.
+`durable-go` takes a zero-infra, in-process approach: a single Go library with a filesystem-backed journal store running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results in your store. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox.
 
+> **Single-process only.** The built-in journal store is designed for use within one OS process. Do not share the store directory across multiple processes or pods — concurrent appends from separate processes corrupt the journal. For distributed workloads, implement the `Store` interface backed by a server-mode database of your choice.
 
 ## Install
 
@@ -36,7 +37,7 @@ Most durable-execution frameworks require external infrastructure—such as a de
 go get github.com/agenticenv/durable-go@latest
 ```
 
-Go 1.26.5+. No infrastructure required. The included SQLite driver writes a local file.
+Go 1.26.5+. No infrastructure required. No external dependencies — the included journal store writes to the local filesystem.
 
 ## Quick Start
 
@@ -45,11 +46,11 @@ import (
     "context"
 
     durable "github.com/agenticenv/durable-go"
-    "github.com/agenticenv/durable-go/store/sqlite"
+    "github.com/agenticenv/durable-go/store/journal"
 )
 
 // errors omitted for brevity
-store, _ := sqlite.NewSQLiteStore("app.db")
+store, _ := journal.NewJournalStore("./durable-data")
 defer store.Close()
 
 client, _ := durable.NewClient(context.Background(), store)
@@ -73,7 +74,7 @@ out, _ := durable.Run(context.Background(), handle, "hello", durable.Func(
 _ = out
 ```
 
-Full example: [`examples/payment/`](examples/payment/).
+Full example: [`examples/func-task/`](examples/func-task/).
 
 ### Struct-based tasks
 
@@ -94,11 +95,18 @@ func (j *Job) Exec(ctx context.Context, s *durable.StepRunner, id string) (strin
 out, _ := durable.Run(ctx, handle, "42", &Job{DB: db, Mail: mailer})
 ```
 
-Full example: [`examples/agent/`](examples/agent/).
+Full example: [`examples/struct-task/`](examples/struct-task/).
 
 ## Resume
 
 Call `Run` again with the same `NewTask` ID and the same input. Completed steps replay from the store. After a crash, leftover records show as `StatusRunning` in `ListTasks`; you still call `Run` — the library does not auto-resume.
+
+To detect zombie running tasks from a previous crash, use `durable.ListStaleTasks`:
+
+```go
+stale, err := durable.ListStaleTasks(ctx, store, 10*time.Minute)
+// stale contains tasks with status=running not updated in the last 10 minutes
+```
 
 Full example: [`examples/resume/`](examples/resume/).
 
@@ -123,12 +131,14 @@ Runnable examples in [examples/](examples/) — see [examples/README.md](example
 | Example | What it shows |
 |---------|----------------|
 | [`examples/resume/`](examples/resume/) | Crash after step 2, resume from cache |
-| [`examples/payment/`](examples/payment/) | Closure-style `durable.Func` |
-| [`examples/agent/`](examples/agent/) | Struct task with injected deps |
+| [`examples/func-task/`](examples/func-task/) | Closure-style `durable.Func` |
+| [`examples/struct-task/`](examples/struct-task/) | Struct task with injected deps, retries, timeout |
 
 ```bash
 # from repo root
 go run ./examples/resume/
+go run ./examples/func-task/
+go run ./examples/struct-task/
 ```
 
 ## Development

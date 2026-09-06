@@ -11,7 +11,7 @@ import (
 	"os"
 
 	durable "github.com/agenticenv/durable-go"
-	"github.com/agenticenv/durable-go/store/sqlite"
+	"github.com/agenticenv/durable-go/store/journal"
 )
 
 // --- domain types ---
@@ -85,10 +85,10 @@ var processPayment = durable.Func(func(
 func main() {
 	ctx := context.Background()
 
-	if err := os.MkdirAll("examples/payment/.data", 0o755); err != nil {
+	if err := os.MkdirAll("examples/func-task/.data", 0o755); err != nil {
 		log.Fatal(err)
 	}
-	store, err := sqlite.NewSQLiteStore("examples/payment/.data/payment.db")
+	store, err := journal.NewJournalStore("examples/func-task/.data/payment-journal")
 	if err != nil {
 		log.Fatal(err)
 	}

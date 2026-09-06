@@ -27,7 +27,7 @@ go.work.sum
 # env file
 .env
 
-# Example runtime data (SQLite databases created by go run ./examples/...)
+# Example runtime data (journal store directories created by go run ./examples/...)
 examples/**/.data/
 
 # Editor/IDE

@@ -84,9 +84,36 @@ type StepRecord struct {
 	CompletedAt time.Time
 }
 
+// ListStaleTasks returns all tasks with StatusRunning whose UpdatedAt is older
+// than staleSince ago. These tasks were most likely left in the running state
+// by a previous process crash and were never resumed.
+//
+// Callers can inspect the returned tasks and decide whether to re-run them
+// (by calling Run with the same task ID, which will replay completed steps)
+// or mark them failed via DeleteTask and starting fresh.
+//
+//	stale, err := durable.ListStaleTasks(ctx, store, 10*time.Minute)
+func ListStaleTasks(ctx context.Context, store Store, staleSince time.Duration) ([]TaskInfo, error) {
+	tasks, err := store.ListTasks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cutoff := time.Now().UTC().Add(-staleSince)
+	var stale []TaskInfo
+	for _, t := range tasks {
+		if t.Status == StatusRunning && t.UpdatedAt.Before(cutoff) {
+			stale = append(stale, t)
+		}
+	}
+	return stale, nil
+}
+
 // Store is the persistence contract for durable task and step state.
 // All implementations must be safe for concurrent use by multiple goroutines.
 // Implementations must treat writes as upserts (idempotent on ID conflict).
+//
+// durable-go's built-in store (store/journal) is designed for single-process
+// use only. Do not share a store across multiple OS processes or pods.
 type Store interface {
 	// SaveTask persists or updates a TaskInfo record.
 	// Must be an upsert: if a record with task.ID already exists, all mutable

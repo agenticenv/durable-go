@@ -102,12 +102,10 @@ task test-coverage
 From the repo root:
 
 ```bash
-go run ./examples/resume/
-go run ./examples/payment/
-go run ./examples/agent/
+go run ./examples/<name>/
 ```
 
-See [examples/README.md](examples/README.md). Example SQLite files are written under `examples/<name>/.data/` (gitignored).
+See [examples/README.md](examples/README.md) for the full list. Journal store data is written under `examples/<name>/.data/` (gitignored).
 
 ## Ways to Contribute
 

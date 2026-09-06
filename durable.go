@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"time"
 )
 
@@ -61,10 +62,14 @@ func WithLogger(logger *slog.Logger) Option {
 //
 // Always call Close (or defer it) when the Client is no longer needed to stop
 // the background auto-purger goroutine and release associated resources.
+//
+// durable-go is designed for single-process use only. Do not share the
+// underlying store across multiple OS processes or pods.
 type Client struct {
-	store  Store
-	cfg    config
-	stopCh chan struct{} // closed by Close to signal the purger goroutine to exit
+	store     Store
+	cfg       config
+	stopCh    chan struct{} // closed by Close to signal the purger goroutine to exit
+	taskLocks sync.Map      // taskID → *sync.Mutex; serialises concurrent Run calls per task ID
 }
 
 // NewClient initialises a Client bound to the given store.
@@ -162,6 +167,13 @@ func (c *Client) Close() error {
 // same task ID result in undefined behaviour; callers must serialise per task ID.
 func Run[I, O any](ctx context.Context, h *TaskHandle, input I, task Task[I, O]) (O, error) {
 	var zero O
+
+	// 0. Serialise concurrent Run calls for the same task ID within this process.
+	// Concurrent calls with different task IDs are unaffected (no contention).
+	actual, _ := h.client.taskLocks.LoadOrStore(h.cfg.id, &sync.Mutex{})
+	taskMu := actual.(*sync.Mutex)
+	taskMu.Lock()
+	defer taskMu.Unlock()
 
 	// 1. Apply timeout if configured.
 	if h.cfg.timeout > 0 {

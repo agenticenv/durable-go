@@ -8,11 +8,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"time"
 
 	durable "github.com/agenticenv/durable-go"
-	"github.com/agenticenv/durable-go/store/sqlite"
+	"github.com/agenticenv/durable-go/store/journal"
 )
 
 // --- injected dependency stubs (replace with real clients in production) ---
@@ -115,10 +116,10 @@ func (r *AgentRunner) Exec(ctx context.Context, s *durable.StepRunner, in AgentI
 func main() {
 	ctx := context.Background()
 
-	if err := os.MkdirAll("examples/agent/.data", 0o755); err != nil {
+	if err := os.MkdirAll("examples/struct-task/.data", 0o755); err != nil {
 		log.Fatal(err)
 	}
-	store, err := sqlite.NewSQLiteStore("examples/agent/.data/agent.db")
+	store, err := journal.NewJournalStore("examples/struct-task/.data/agent-journal", journal.WithLogger(slog.Default()))
 	if err != nil {
 		log.Fatal(err)
 	}

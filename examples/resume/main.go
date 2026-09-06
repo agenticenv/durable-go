@@ -21,7 +21,7 @@ import (
 	"time"
 
 	durable "github.com/agenticenv/durable-go"
-	"github.com/agenticenv/durable-go/store/sqlite"
+	"github.com/agenticenv/durable-go/store/journal"
 )
 
 // crashAfter reads the CRASH_AFTER env var. When set to "2", the process
@@ -102,7 +102,7 @@ func main() {
 	if err := os.MkdirAll("examples/resume/.data", 0o755); err != nil {
 		log.Fatal(err)
 	}
-	store, err := sqlite.NewSQLiteStore("examples/resume/.data/resume-demo.db", sqlite.WithLogger(logger))
+	store, err := journal.NewJournalStore("examples/resume/.data/resume-journal", journal.WithLogger(logger))
 	if err != nil {
 		log.Fatal(err)
 	}
