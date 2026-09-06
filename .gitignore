@@ -33,3 +33,4 @@ examples/**/.data/
 # Editor/IDE
 # .idea/
 # .vscode/
+.DS_Store

@@ -1,6 +1,6 @@
 # Contributing to durable-go
 
-Thank you for your interest in contributing. **durable-go** is a single-node Go library for fault-tolerant task execution and step memoization. This document explains how to set up your environment and what we expect from contributors.
+Thank you for your interest in contributing. **durable-go** is a single-process Go library for fault-tolerant task execution and step memoization. This document explains how to set up your environment and what we expect from contributors.
 
 ## Contributor License Agreement (CLA)
 
