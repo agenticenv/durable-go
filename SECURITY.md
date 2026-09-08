@@ -19,8 +19,8 @@ We appreciate responsible disclosure and will acknowledge security researchers w
 
 ## Scope
 
-- Security issues in the durable-go engine (`Run`, `Step`, task lifecycle)
-- Persistence drivers under `store/` (e.g. SQLite)
+- Security issues in the durable-go engine (`NewEngine`, `RunTask`, `RunStep`, `CompleteStep`, task lifecycle)
+- The filesystem journal under `dataDir` (`meta.json`, `journal.log`, `output.json`, OS flock)
 - Sensitive data exposure in persisted task or step records
 
 ## Security Considerations
@@ -29,15 +29,13 @@ We appreciate responsible disclosure and will acknowledge security researchers w
 
 Step results are JSON-marshalled and stored. Do not put secrets, API keys, or credentials in task inputs or step outputs.
 
-### SQLite files
+### Journal files
 
-The SQLite driver writes a local database file. Restrict filesystem permissions on that file. Do not commit `*.db` files or `examples/**/.data/` directories.
+The engine writes `meta.json`, `journal.log`, and `output.json` under `dataDir/tasks/`. Restrict filesystem permissions on that directory. Do not commit `examples/**/.data/` directories.
 
 ### Third-party dependencies
 
-Monitor via **Dependabot** (`.github/dependabot.yml`) and **`govulncheck`** (`task govuln`, Security workflow, and Release hard-fail):
-
-- modernc.org/sqlite
+Monitor via **Dependabot** (`.github/dependabot.yml`) and **`govulncheck`** (`task govuln`, Security workflow, and Release hard-fail).
 
 ## Out of Scope
 

@@ -25,7 +25,7 @@ tasks:
   # ── Build ─────────────────────────────────────────────────────────────────
 
   build:
-    desc: Compile all packages (core + store/sqlite + examples)
+    desc: Compile all packages (library + examples)
     cmds:
       - echo "==> Building durable-go..."
       - go build ./...
@@ -51,6 +51,13 @@ tasks:
       - go tool cover -func=coverage.out | grep '^total:'
       - go tool cover -html=coverage.out -o coverage.html
       - 'echo "==> Coverage report: coverage.html"'
+
+  proto:
+    desc: Regenerate pb/journal.pb.go from journal.proto
+    cmds:
+      - echo "==> go generate ./pb/"
+      - go generate ./pb/
+      - echo "==> Proto generate complete"
 
   # ── Format ────────────────────────────────────────────────────────────────
 
@@ -113,11 +120,10 @@ tasks:
   # ── Clean ─────────────────────────────────────────────────────────────────
 
   clean:
-    desc: Remove coverage artifacts and any SQLite test/example databases
+    desc: Remove coverage artifacts
     cmds:
       - echo "==> Cleaning..."
       - rm -f coverage.out coverage.html
-      - find . -name '*.db' -not -path '*/\.*' -delete
       - echo "==> Clean complete"
 
   # ── Security ──────────────────────────────────────────────────────────────

@@ -14,22 +14,22 @@
 
 ## Features
 
-- **Typed tasks** — generic `Run` / `Task` with input and output types.
-- **Memoized steps** — completed steps replay from the store; they are not run again.
-- **In-process** — no cluster or workflow server; one process, one store.
-- **Pluggable persistence** — `Store` interface; journal-per-task filesystem store included.
-- **Timeouts and retries** — `WithTimeout`, `WithMaxRetries` on the task handle.
+- **Engine API** — `NewEngine`, `RegisterTask`, `RunTask`, `RunStep` in a single package.
+- **Memoized steps** — completed steps replay from the journal; they are not run again.
+- **Pending steps** — return `ErrStepPending` and complete later via `CompleteStep` (human approval, webhooks).
+- **Fire-and-forget runs** — `RunTask` returns immediately; `TaskRun.Get` waits; `RunID()` is available at once.
+- **Timeouts and retries** — engine / task / run / step options. Retries default to 0 (opt-in).
 - **Panic recovery** — task and step panics are recorded and returned as errors.
-- **Auto-purge** — optional background cleanup of old completed and failed records.
+- **Auto-purge** — optional background cleanup of old completed and failed runs.
 - **Flexible execution** — tasks as `durable.Func` closures or structs with `Exec`.
 
 ## Why durable-go
 
 Most durable-execution frameworks require external infrastructure—such as a dedicated workflow server or a Postgres database—and enforce strict code execution models like replay determinism.
 
-`durable-go` takes a zero-infra, in-process approach: a single Go library with a filesystem-backed journal store running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results in your store. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox.
+`durable-go` takes a zero-infra, in-process approach: a single Go library with a filesystem journal running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox.
 
-> **Single-process only.** The built-in journal store is designed for use within one OS process. Do not share the store directory across multiple processes or pods — concurrent appends from separate processes corrupt the journal. For distributed workloads, implement the `Store` interface backed by a server-mode database of your choice.
+> **One writer per dataDir.** `NewEngine` takes an exclusive OS flock on `<dataDir>/.lock`. Do not open the same directory from two writer processes. Another process can open the same directory with `NewReadOnlyEngine` (shared lock).
 
 ## Install
 
@@ -37,76 +37,92 @@ Most durable-execution frameworks require external infrastructure—such as a de
 go get github.com/agenticenv/durable-go@latest
 ```
 
-Go 1.26.5+. No infrastructure required. No external dependencies — the included journal store writes to the local filesystem.
+Go 1.26.5+. No infrastructure required.
 
 ## Quick Start
 
 ```go
-import (
-    "context"
+e, err := durable.NewEngine(ctx, "./data", durable.WithLogger(logger))
+if err != nil { ... }
+defer e.Close()
 
-    durable "github.com/agenticenv/durable-go"
-    "github.com/agenticenv/durable-go/store/journal"
-)
-
-// errors omitted for brevity
-store, _ := journal.NewJournalStore("./durable-data")
-defer store.Close()
-
-client, _ := durable.NewClient(context.Background(), store)
-defer client.Close()
-
-handle := client.NewTask("job-42", durable.WithName("Example job"))
-
-out, _ := durable.Run(context.Background(), handle, "hello", durable.Func(
-    func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-        greet, err := durable.Step(ctx, s, "greet", func(ctx context.Context) (string, error) {
-            return in + " world", nil
-        })
+err = durable.RegisterTask(e, "process-order", durable.Func(
+    func(ctx context.Context, s *durable.StepRunner, in OrderInput) (OrderOutput, error) {
+        charged, err := durable.RunStep(ctx, s, "charge", func(ctx context.Context) (string, error) {
+            return chargeCard(in)
+        }).Get(ctx)
         if err != nil {
-            return "", err
+            return OrderOutput{}, err
         }
-        return durable.Step(ctx, s, "upper", func(ctx context.Context) (string, error) {
-            return greet, nil
-        })
+        shipped, err := durable.RunStep(ctx, s, "ship", func(ctx context.Context) (string, error) {
+            return scheduleShip(charged)
+        }).Get(ctx)
+        if err != nil {
+            return OrderOutput{}, err
+        }
+        return OrderOutput{Result: shipped}, nil
     },
 ))
-_ = out
+
+run := durable.RunTask[OrderInput, OrderOutput](ctx, e, "process-order", "", input)
+storeRunID(run.RunID())      // available immediately before Get
+output, err := run.Get(ctx)  // block for result
 ```
 
 Full example: [`examples/func-task/`](examples/func-task/).
 
 ### Struct-based tasks
 
-For services with injected dependencies, implement `Exec` on a struct and pass it to `Run`:
+For services with injected dependencies, implement `Exec` on a struct and pass it to `RegisterTask`:
 
 ```go
 type Job struct {
-    DB    *Database
-    Mail  Mailer
+    DB   *Database
+    Mail Mailer
 }
 
 func (j *Job) Exec(ctx context.Context, s *durable.StepRunner, id string) (string, error) {
-    return durable.Step(ctx, s, "notify", func(ctx context.Context) (string, error) {
+    return durable.RunStep(ctx, s, "notify", func(ctx context.Context) (string, error) {
         return j.Mail.Send(ctx, id)
-    })
+    }).Get(ctx)
 }
 
-out, _ := durable.Run(ctx, handle, "42", &Job{DB: db, Mail: mailer})
+durable.RegisterTask(e, "notify", &Job{DB: db, Mail: mailer})
+run := durable.RunTask[string, string](ctx, e, "notify", "", "42")
+out, err := run.Get(ctx)
 ```
 
 Full example: [`examples/struct-task/`](examples/struct-task/).
 
-## Resume
+### Pending steps
 
-Call `Run` again with the same `NewTask` ID and the same input. Completed steps replay from the store. After a crash, leftover records show as `StatusRunning` in `ListTasks`; you still call `Run` — the library does not auto-resume.
-
-To detect zombie running tasks from a previous crash, use `durable.ListStaleTasks`:
+A step suspends itself by returning `ErrStepPending`. An external caller completes it with the token from `StepToken()`:
 
 ```go
-stale, err := durable.ListStaleTasks(ctx, store, 10*time.Minute)
-// stale contains tasks with status=running not updated in the last 10 minutes
+approval, err := durable.RunStep(ctx, s, "approve", func(ctx context.Context) (Approval, error) {
+    token := s.StepToken()
+    sendEmail("manager@co.com", token)
+    return Approval{}, durable.ErrStepPending
+}).Get(ctx)
+
+// webhook / CLI / another goroutine:
+durable.CompleteStep(ctx, e, token, Approval{By: "manager@co.com"})
 ```
+
+## Resume
+
+Register tasks after every `NewEngine`, then resume active runs. Pass the saved runID (or `""` to resume the oldest Running/Waiting run for that taskID). Completed steps replay from the journal.
+
+```go
+durable.RegisterTask(e, "process-order", ...)
+pending, _ := e.ListTasks(ctx, durable.StatusRunning, durable.StatusWaiting)
+for _, t := range pending {
+    run := durable.RunTask[OrderInput, OrderOutput](ctx, e, t.TaskID, t.RunID, reloadInput(t))
+    go func() { _, _ = run.Get(ctx) }()
+}
+```
+
+Task inputs are not persisted. Pass the same input when resuming.
 
 Full example: [`examples/resume/`](examples/resume/).
 
@@ -114,15 +130,16 @@ Full example: [`examples/resume/`](examples/resume/).
 
 Follow these when you write a task. On resume, the task runs again from the top; completed steps are reused, not re-executed.
 
-1. **Side effects in `Step`.** Do not call an API, write to a database, or publish to a queue in the task body. Wrap that work in `durable.Step`.
-2. **Non-deterministic values in `Step`.** Do not use `time.Now()`, UUIDs, or random values in the task body to choose a step ID or a branch. Generate them inside a `Step` so resume sees the same result.
+1. **Side effects in `RunStep`.** Do not call an API, write to a database, or publish to a queue in the task body. Wrap that work in `durable.RunStep`.
+2. **Non-deterministic values in `RunStep`.** Do not use `time.Now()`, UUIDs, or random values in the task body to choose a step ID or a branch. Generate them inside a `RunStep` so resume sees the same result.
 3. **Idempotent steps.** A crash can re-run a step after the side effect already happened. Charging a card or sending mail must be safe to do twice (or no-op).
 
 Also:
 
-- **Unique step IDs** — one stable string per step (literals or deterministic keys). Reusing an ID returns the first completed result.
-- **JSON results** — step outputs must be JSON-marshalable.
-- **Same task ID to resume** — task inputs are not persisted; pass the same input to `Run` when resuming. Do not call `Run` concurrently for the same ID.
+- **Unique step IDs** — one stable string per step (literals or `fmt.Sprintf("step-%d", i)`). Reusing an ID panics.
+- **Sequential `RunStep` calls** — concurrent calls on the same `StepRunner` panic. Fan out work, then persist results sequentially.
+- **JSON results** — step and task outputs must be JSON-marshalable.
+- **Same runID to resume** — inputs are not persisted; pass the same input to `RunTask` when resuming.
 
 ## Examples
 

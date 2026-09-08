@@ -7,9 +7,6 @@
 //
 //  2. Second run – resumes from step 3 (steps 1 & 2 are replayed from cache):
 //     go run .
-//
-// Watch the logs: on the second run you will see "↩ replayed from cache" for the
-// first two steps, proving they were never re-executed.
 package main
 
 import (
@@ -21,14 +18,9 @@ import (
 	"time"
 
 	durable "github.com/agenticenv/durable-go"
-	"github.com/agenticenv/durable-go/store/journal"
 )
 
-// crashAfter reads the CRASH_AFTER env var. When set to "2", the process
-// exits hard after step 2 to simulate a mid-run crash.
 var crashAfter = os.Getenv("CRASH_AFTER")
-
-// --- domain types ---
 
 type ReportInput struct {
 	ReportID string
@@ -39,33 +31,27 @@ type ReportOutput struct {
 	Delivered bool
 }
 
-// --- task ---
-
 var generateReport = durable.Func(func(
 	ctx context.Context,
 	s *durable.StepRunner,
 	in ReportInput,
 ) (ReportOutput, error) {
 
-	// Step 1 – fetch raw data from the database.
-	_, err := durable.Step(ctx, s, "fetch-data", func(ctx context.Context) (struct{}, error) {
+	_, err := durable.RunStep(ctx, s, "fetch-data", func(ctx context.Context) (struct{}, error) {
 		log.Printf("  → [fetch-data]   querying database for report %s …", in.ReportID)
-		time.Sleep(200 * time.Millisecond) // simulate DB query
+		time.Sleep(200 * time.Millisecond)
 		log.Printf("  ✓ [fetch-data]   done")
 		return struct{}{}, nil
-	})
+	}).Get(ctx)
 	if err != nil {
 		return ReportOutput{}, err
 	}
 
-	// Step 2 – run a heavy computation / ML inference.
-	_, err = durable.Step(ctx, s, "run-computation", func(ctx context.Context) (struct{}, error) {
+	_, err = durable.RunStep(ctx, s, "run-computation", func(ctx context.Context) (struct{}, error) {
 		log.Printf("  → [run-computation]  running expensive model inference …")
-		time.Sleep(300 * time.Millisecond) // simulate expensive work
+		time.Sleep(300 * time.Millisecond)
 		log.Printf("  ✓ [run-computation]  done")
 
-		// ── Simulate a crash immediately after this step succeeds ──
-		// In reality this could be: OOM kill, power loss, os.Exit from a signal handler, etc.
 		if crashAfter == "2" {
 			log.Println()
 			log.Println("💥  SIMULATED CRASH after step 2 (CRASH_AFTER=2)")
@@ -75,18 +61,17 @@ var generateReport = durable.Func(func(
 		}
 
 		return struct{}{}, nil
-	})
+	}).Get(ctx)
 	if err != nil {
 		return ReportOutput{}, err
 	}
 
-	// Step 3 – deliver the report via email / webhook.
-	out, err := durable.Step(ctx, s, "deliver-report", func(ctx context.Context) (ReportOutput, error) {
+	out, err := durable.RunStep(ctx, s, "deliver-report", func(ctx context.Context) (ReportOutput, error) {
 		log.Printf("  → [deliver-report]  sending report %s …", in.ReportID)
-		time.Sleep(100 * time.Millisecond) // simulate HTTP call
+		time.Sleep(100 * time.Millisecond)
 		log.Printf("  ✓ [deliver-report]  sent")
 		return ReportOutput{ReportID: in.ReportID, Delivered: true}, nil
-	})
+	}).Get(ctx)
 	if err != nil {
 		return ReportOutput{}, err
 	}
@@ -99,26 +84,19 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	if err := os.MkdirAll("examples/resume/.data", 0o755); err != nil {
-		log.Fatal(err)
-	}
-	store, err := journal.NewJournalStore("examples/resume/.data/resume-journal", journal.WithLogger(logger))
+	e, err := durable.NewEngine(ctx, "examples/resume/.data/resume-journal", durable.WithLogger(logger))
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = e.Close() }()
 
-	client, err := durable.NewClient(ctx, store, durable.WithLogger(logger))
-	if err != nil {
+	if err := durable.RegisterTask(e, "weekly-report", generateReport,
+		durable.WithName("Weekly Report – Sep 2026"),
+	); err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = client.Close() }()
 
-	// Same taskID on every run — this is what enables replay.
-	// Changing it starts a fresh execution with no cached steps.
-	const taskID = "report-weekly-2026-09"
-
-	handle := client.NewTask(taskID, durable.WithName("Weekly Report – Sep 2026"))
+	const runID = "report-weekly-2026-09"
 
 	if crashAfter == "2" {
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -130,7 +108,8 @@ func main() {
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	}
 
-	out, err := durable.Run(ctx, handle, ReportInput{ReportID: taskID}, generateReport)
+	run := durable.RunTask[ReportInput, ReportOutput](ctx, e, "weekly-report", runID, ReportInput{ReportID: runID})
+	out, err := run.Get(ctx)
 	if err != nil {
 		log.Fatalf("task failed: %v", err)
 	}

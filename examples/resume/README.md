@@ -23,11 +23,11 @@ go run .
 
 **Run 2**
 ```
-  ↩ [fetch-data]       replayed from cache
-  ↩ [run-computation]  replayed from cache
   → [deliver-report]   sending report …     ✓
 ✅  Report delivered: true
 ```
+
+On run 2, `fetch-data` and `run-computation` return from the journal without calling the step functions.
 
 ## Reset
 

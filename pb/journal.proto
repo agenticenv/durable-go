@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package durablepb;
+
+option go_package = "github.com/agenticenv/durable-go/pb;durablepb";
+
+// StepStatus is the lifecycle state of a step checkpoint.
+//
+// Enum value contract (never reuse or renumber):
+//   0  STEP_STATUS_UNSPECIFIED  — zero value / unknown
+//   1  STEP_STATUS_WAITING      — step suspended awaiting external signal or approval
+//   2  STEP_STATUS_COMPLETED    — step executed successfully; result is cached
+//   3  STEP_STATUS_FAILED       — step returned an error or panicked
+enum StepStatus {
+  STEP_STATUS_UNSPECIFIED = 0;
+  STEP_STATUS_WAITING     = 1;
+  STEP_STATUS_COMPLETED   = 2;
+  STEP_STATUS_FAILED      = 3;
+}
+
+// StepEntry is the binary wire format for a single step checkpoint written to
+// journal.log. Using protobuf means:
+//   - New fields can be added in future library versions with a new field number.
+//   - Unknown fields are preserved on round-trip by the proto runtime.
+//   - Old readers silently ignore fields they don't recognise (forward compatibility).
+//   - Removing a field leaves the field number reserved, so old data still decodes (backward compatibility).
+//
+// Field-number contract (never reuse or renumber):
+//   1  step_id
+//   2  seq
+//   3  status
+//   4  result
+//   5  error
+//   6  panic_trace
+//   7  input_hash
+//   8  started_at_ns
+//   9  completed_at_ns
+message StepEntry {
+  // step_id is the caller-supplied, run-scoped identifier (durable.StepRecord.StepID).
+  string step_id = 1;
+
+  // seq is the 1-based execution order within the parent run.
+  int32 seq = 2;
+
+  // status is the lifecycle state of this step.
+  StepStatus status = 3;
+
+  // result is the JSON-marshalled output of a completed step.
+  // Empty for waiting/failed entries.
+  bytes result = 4;
+
+  // error is the serialised error string for a failed step.
+  string error = 5;
+
+  // panic_trace holds the recovered panic value and stack (if the step panicked).
+  string panic_trace = 6;
+
+  // input_hash is a hash of the step input bytes; used to detect input change
+  // between retries. Empty in v1 because RunStep has no input parameter.
+  string input_hash = 7;
+
+  // started_at_ns is Unix time in nanoseconds when the step function was invoked.
+  int64 started_at_ns = 8;
+
+  // completed_at_ns is Unix time in nanoseconds when the step reached a terminal state.
+  // Zero for waiting entries that have not yet completed.
+  int64 completed_at_ns = 9;
+}
+
+// SignalEntry records an external completion payload for a waiting step.
+// Written by CompleteStep; consumed on resume when a WAITING step has a
+// matching SignalEntry (signal_id == step_id).
+//
+// Field-number contract (never reuse or renumber):
+//   1  signal_id
+//   2  payload
+//   3  sent_at_ns
+message SignalEntry {
+  // signal_id is the step_id of the waiting step this payload completes.
+  string signal_id = 1;
+
+  // payload is the JSON-encoded result delivered by CompleteStep.
+  bytes payload = 2;
+
+  // sent_at_ns is Unix time in nanoseconds when CompleteStep was called.
+  int64 sent_at_ns = 3;
+}
+
+// JournalEntry is the top-level frame written to journal.log.
+// Using oneof keeps the format extensible for future entry types without
+// field number conflicts.
+message JournalEntry {
+  oneof entry {
+    StepEntry   step   = 1;
+    SignalEntry signal = 2;
+  }
+}

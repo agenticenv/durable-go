@@ -30,7 +30,7 @@ What actually happened.
 
 - Go version: (e.g. 1.26.x; must be ≥ the `go` line in `go.mod`)
 - OS: (e.g. macOS, Linux)
-- Store driver: (e.g. sqlite)
+- dataDir / OS flock notes: (if relevant)
 - Library version or commit: (e.g. v0.1.0 or main@abc123)
 
 ## Code / config

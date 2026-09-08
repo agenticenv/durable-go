@@ -1,7 +1,7 @@
 // Package main demonstrates the struct / method-receiver style of durable-go.
 // AgentRunner is a production-style struct with injected dependencies.
 // It implements durable.Task[AgentInput, AgentOutput] so it can be passed
-// directly to durable.Run – no adapter or wrapper needed.
+// directly to RegisterTask.
 package main
 
 import (
@@ -9,14 +9,10 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"os"
 	"time"
 
 	durable "github.com/agenticenv/durable-go"
-	"github.com/agenticenv/durable-go/store/journal"
 )
-
-// --- injected dependency stubs (replace with real clients in production) ---
 
 type OpenAIClient struct{ Model string }
 
@@ -36,8 +32,6 @@ func (db *Database) FetchContext(ctx context.Context, userID string) (string, er
 	log.Printf("[db] fetching context for user=%s …", userID)
 	return fmt.Sprintf("prior context for user %s", userID), nil
 }
-
-// --- domain types ---
 
 type AgentInput struct {
 	UserID string
@@ -60,52 +54,42 @@ type LLMCompletion struct {
 	Tokens   int
 }
 
-// --- task implementation as a struct ---
-
 // AgentRunner implements durable.Task[AgentInput, AgentOutput].
-// Dependencies are injected at construction time; steps capture them via the receiver.
 type AgentRunner struct {
 	AI *OpenAIClient
 	DB *Database
 }
 
-// Exec implements durable.Task. Each logical operation is wrapped in a durable.Step
-// so that crashes after any step are recovered transparently on the next run.
 func (r *AgentRunner) Exec(ctx context.Context, s *durable.StepRunner, in AgentInput) (AgentOutput, error) {
-
-	// Step 1 – fetch user context from the database.
-	uctx, err := durable.Step(ctx, s, "fetch-user-context", func(ctx context.Context) (UserContext, error) {
+	uctx, err := durable.RunStep(ctx, s, "fetch-user-context", func(ctx context.Context) (UserContext, error) {
 		history, err := r.DB.FetchContext(ctx, in.UserID)
 		if err != nil {
 			return UserContext{}, fmt.Errorf("fetch context: %w", err)
 		}
 		return UserContext{UserID: in.UserID, History: history}, nil
-	})
+	}).Get(ctx)
 	if err != nil {
 		return AgentOutput{}, err
 	}
 
-	// Step 2 – run LLM completion.
-	// On replay the API is NOT called again; the cached completion is returned as-is.
 	prompt := fmt.Sprintf("Context: %s\nQuery: %s", uctx.History, in.Query)
-	completion, err := durable.Step(ctx, s, "run-llm-completion", func(ctx context.Context) (LLMCompletion, error) {
+	completion, err := durable.RunStep(ctx, s, "run-llm-completion", func(ctx context.Context) (LLMCompletion, error) {
 		resp, err := r.AI.Complete(ctx, prompt)
 		if err != nil {
 			return LLMCompletion{}, fmt.Errorf("llm completion: %w", err)
 		}
 		return LLMCompletion{Response: resp, Model: r.AI.Model, Tokens: len(resp)}, nil
-	})
+	}).Get(ctx)
 	if err != nil {
 		return AgentOutput{}, err
 	}
 
-	// Step 3 – persist the response as a memory entry.
-	_, err = durable.Step(ctx, s, "persist-memory", func(ctx context.Context) (struct{}, error) {
+	_, err = durable.RunStep(ctx, s, "persist-memory", func(ctx context.Context) (struct{}, error) {
 		if err := r.DB.SaveMemory(ctx, in.UserID, completion.Response); err != nil {
 			return struct{}{}, fmt.Errorf("persist memory: %w", err)
 		}
 		return struct{}{}, nil
-	})
+	}).Get(ctx)
 	if err != nil {
 		return AgentOutput{}, err
 	}
@@ -116,39 +100,35 @@ func (r *AgentRunner) Exec(ctx context.Context, s *durable.StepRunner, in AgentI
 func main() {
 	ctx := context.Background()
 
-	if err := os.MkdirAll("examples/struct-task/.data", 0o755); err != nil {
-		log.Fatal(err)
-	}
-	store, err := journal.NewJournalStore("examples/struct-task/.data/agent-journal", journal.WithLogger(slog.Default()))
+	e, err := durable.NewEngine(ctx, "examples/struct-task/.data/agent-journal",
+		durable.WithLogger(slog.Default()),
+		durable.WithAutoPurge(24*time.Hour),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
-
-	client, err := durable.NewClient(ctx, store, durable.WithAutoPurge(24*time.Hour))
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() { _ = client.Close() }()
+	defer func() { _ = e.Close() }()
 
 	runner := &AgentRunner{
 		AI: &OpenAIClient{Model: "gpt-4o"},
 		DB: &Database{DSN: "postgres://localhost/myapp"},
 	}
 
-	handle := client.NewTask(
-		"agent-run-user-99-session-1",
+	if err := durable.RegisterTask(e, "agent-run", runner,
 		durable.WithName("Agent Run – User 99"),
 		durable.WithTag("user_id", "99"),
 		durable.WithTag("env", "production"),
-		durable.WithTimeout(30*time.Second),
-		durable.WithMaxRetries(2),
-	)
+		durable.WithTaskTimeout(30*time.Second),
+		durable.WithTaskMaxRetries(2),
+	); err != nil {
+		log.Fatal(err)
+	}
 
-	out, err := durable.Run(ctx, handle, AgentInput{
+	run := durable.RunTask[AgentInput, AgentOutput](ctx, e, "agent-run", "agent-run-user-99-session-1", AgentInput{
 		UserID: "99",
 		Query:  "Summarise my last three orders.",
-	}, runner)
+	})
+	out, err := run.Get(ctx)
 	if err != nil {
 		log.Fatalf("agent task failed: %v", err)
 	}

@@ -19,6 +19,8 @@ Before contributing, ensure you have:
 | **golangci-lint** | Required for `task lint` — install **v2** with Go **≥** the `go` line in `go.mod`: `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest` |
 | **gofmt** | `task lint` runs `gofmt -s` check first; run `task fmt` to apply `gofmt -s -w` project-wide |
 | **misspell** | `task spell` or `task lint` — typos via `misspell` |
+| **protoc** | Only needed if you edit `pb/journal.proto`. Install: `brew install protobuf` |
+| **protoc-gen-go** | Only needed if you edit `pb/journal.proto`. Install: `go install google.golang.org/protobuf/cmd/protoc-gen-go@latest` |
 
 ## Development Workflow
 
@@ -52,7 +54,7 @@ git checkout -b <branch-name>
 | `feat/` | New features (e.g. `feat/add-retry`, `feat/step-timeout`) |
 | `fix/` | Bug fixes (e.g. `fix/nil-pointer`, `fix/replay-cache`) |
 | `docs/` | Documentation only (e.g. `docs/readme`, `docs/api-examples`) |
-| `test/` | Test additions or fixes (e.g. `test/sqlite-purge`) |
+| `test/` | Test additions or fixes (e.g. `test/journal-compact`) |
 | `refactor/` | Code refactoring, no behavior change |
 | `chore/` | Maintenance (deps, tooling, config) |
 
@@ -77,7 +79,7 @@ task test
 Or a specific package:
 
 ```bash
-go test ./store/sqlite/... -count=1 -v
+go test . -count=1 -v
 ```
 
 ### 4. Run linters (included in `task check`)
@@ -90,7 +92,29 @@ This runs `gofmt -s` check, `misspell`, `go vet`, and `golangci-lint`. Use when 
 
 **golangci-lint vs Go version:** If you see `the Go language version used to build golangci-lint is lower than the targeted Go version`, your `golangci-lint` binary is too old for this module (Go 1.26+ requires **golangci-lint v2**). Reinstall: `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`, ensure `$(go env GOPATH)/bin` is on `PATH` ahead of any older install, then run `golangci-lint version` — it should report **v2.x** and a Go build **≥ 1.26**.
 
-### 5. Generate coverage
+### 5. Regenerate protobuf code
+
+If you change `pb/journal.proto`, regenerate the Go bindings:
+
+**Prerequisites** (one-time, in addition to the table above):
+
+```bash
+brew install protobuf
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+```
+
+**Regenerate:**
+
+```bash
+task proto
+# same as: go generate ./pb/
+```
+
+This rewrites `pb/journal.pb.go`. Commit both `journal.proto` and `journal.pb.go` together in the same commit. Never edit `journal.pb.go` by hand — it will be overwritten on the next `go generate`.
+
+**Field-number rule:** field numbers in `journal.proto` are the wire compatibility contract. Never reuse or renumber an existing field. Add new fields with new numbers only. See the comments in `journal.proto` for the reserved-number list.
+
+### 6. Generate coverage
 
 ```bash
 task test-coverage
@@ -125,7 +149,7 @@ Found a bug? **Open an issue** with:
 
 - Steps to reproduce
 - Expected vs actual behavior
-- Go version, OS, and (if relevant) store driver
+- Go version, OS, and (if relevant) dataDir layout
 - Minimal code or config that reproduces the problem
 
 ### Code contributions
@@ -147,9 +171,9 @@ Found a bug? **Open an issue** with:
 3. **Commits**
    - Use [conventional commits](https://www.conventionalcommits.org) — these drive the release changelog:
      - `feat: add step timeout` — features
-     - `fix: honour UpdatedAt on SaveTask` — bug fixes
+     - `fix: honour UpdatedAt on saveMeta` — bug fixes
      - `docs: update README examples` — documentation
-     - `test: add sqlite purge coverage` — tests
+     - `test: add journal compact coverage` — tests
      - `ci: update release workflow` — CI/CD
      - `chore: bump dependencies` — maintenance
    - Prefer one logical change per commit.
@@ -161,7 +185,7 @@ Found a bug? **Open an issue** with:
 
 5. **Scope**
    - Keep changes focused. For larger work, consider splitting into multiple PRs.
-   - New store drivers belong under `store/<driver>/` and must implement `durable.Store`.
+   - v1 has a single journal implementation in package `durable`. Do not add a pluggable Store interface.
 
 ## Releasing (maintainers only)
 
