@@ -80,13 +80,6 @@ func TestRunStep_ConcurrentCallPanic(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					if strings.Contains(fmtPanic(r), "concurrent RunStep") {
-						recovered.Store(true)
-					}
-				}
-			}()
 			_, _ = durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) {
 				close(started)
 				<-block
@@ -95,14 +88,15 @@ func TestRunStep_ConcurrentCallPanic(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			<-started
 			defer func() {
 				if r := recover(); r != nil {
 					if strings.Contains(fmtPanic(r), "concurrent RunStep") {
 						recovered.Store(true)
 					}
 				}
+				close(block)
 			}()
+			<-started
 			_, _ = durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) {
 				return "b", nil
 			}).Get(ctx)
@@ -113,12 +107,6 @@ func TestRunStep_ConcurrentCallPanic(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := durable.RunTask[string, string](context.Background(), e, "conc", "", "")
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first step did not start")
-	}
-	close(block)
 	if _, err := run.Get(context.Background()); err != nil {
 		t.Fatal(err)
 	}
