@@ -19,7 +19,6 @@ import (
 func TestMakeReadFrame_RoundTrip(t *testing.T) {
 	rec := StepRecord{
 		StepID:      "charge",
-		Seq:         1,
 		Status:      StepStatusCompleted,
 		Result:      []byte(`"ok"`),
 		StartedAt:   time.Unix(0, 1_700_000_000_000_000_000).UTC(),
@@ -34,15 +33,18 @@ func TestMakeReadFrame_RoundTrip(t *testing.T) {
 	}
 	frame := makeFrame(payload)
 
-	got, err := readFrame(bytes.NewReader(frame))
+	got, size, err := readFrame(bytes.NewReader(frame))
 	if err != nil {
 		t.Fatalf("readFrame: %v", err)
+	}
+	if size != int64(len(frame)) {
+		t.Fatalf("frame size %d, want %d", size, len(frame))
 	}
 	if got.GetStep() == nil {
 		t.Fatal("expected step entry")
 	}
 	back := protoToStep(got.GetStep())
-	if back.StepID != rec.StepID || back.Seq != rec.Seq || back.Status != rec.Status {
+	if back.StepID != rec.StepID || back.Status != rec.Status {
 		t.Fatalf("round-trip mismatch: got %+v want %+v", back, rec)
 	}
 	if !bytes.Equal(back.Result, rec.Result) {
@@ -51,7 +53,7 @@ func TestMakeReadFrame_RoundTrip(t *testing.T) {
 }
 
 func TestReadFrame_EOFAtEnd(t *testing.T) {
-	_, err := readFrame(bytes.NewReader(nil))
+	_, _, err := readFrame(bytes.NewReader(nil))
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("empty reader: got %v, want io.EOF", err)
 	}
@@ -59,7 +61,7 @@ func TestReadFrame_EOFAtEnd(t *testing.T) {
 
 func TestReadFrame_CRCCorruption(t *testing.T) {
 	entry := &durablepb.JournalEntry{
-		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(StepRecord{StepID: "a", Seq: 1, Status: StepStatusCompleted})},
+		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(StepRecord{StepID: "a", Status: StepStatusCompleted})},
 	}
 	payload, err := proto.Marshal(entry)
 	if err != nil {
@@ -68,7 +70,7 @@ func TestReadFrame_CRCCorruption(t *testing.T) {
 	frame := makeFrame(payload)
 	frame[len(frame)-1] ^= 0xff
 
-	_, err = readFrame(bytes.NewReader(frame))
+	_, _, err = readFrame(bytes.NewReader(frame))
 	if !errors.Is(err, errCorruptFrame) {
 		t.Fatalf("corrupt CRC: got %v, want errCorruptFrame", err)
 	}
@@ -76,7 +78,7 @@ func TestReadFrame_CRCCorruption(t *testing.T) {
 
 func TestReadFrame_PartialTail(t *testing.T) {
 	entry := &durablepb.JournalEntry{
-		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(StepRecord{StepID: "a", Seq: 1, Status: StepStatusCompleted})},
+		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(StepRecord{StepID: "a", Status: StepStatusCompleted})},
 	}
 	payload, err := proto.Marshal(entry)
 	if err != nil {
@@ -85,7 +87,7 @@ func TestReadFrame_PartialTail(t *testing.T) {
 	frame := makeFrame(payload)
 	truncated := frame[:len(frame)/2]
 
-	_, err = readFrame(bytes.NewReader(truncated))
+	_, _, err = readFrame(bytes.NewReader(truncated))
 	if !errors.Is(err, errCorruptFrame) && !errors.Is(err, io.EOF) {
 		t.Fatalf("partial tail: got %v, want corrupt or EOF", err)
 	}
@@ -94,7 +96,7 @@ func TestReadFrame_PartialTail(t *testing.T) {
 func TestReadFrame_HugeLengthRejected(t *testing.T) {
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], maxFramePayload+1)
-	_, err := readFrame(bytes.NewReader(hdr[:]))
+	_, _, err := readFrame(bytes.NewReader(hdr[:]))
 	if !errors.Is(err, errCorruptFrame) {
 		t.Fatalf("huge length: got %v, want errCorruptFrame", err)
 	}
@@ -109,12 +111,12 @@ func TestLoadJournal_CacheAndSignals(t *testing.T) {
 
 	e := &Engine{dataDir: dir}
 	if err := e.appendStep(taskID, runID, StepRecord{
-		StepID: "one", Seq: 1, Status: StepStatusCompleted, Result: []byte(`"a"`),
+		StepID: "one", Status: StepStatusCompleted, Result: []byte(`"a"`),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.appendStep(taskID, runID, StepRecord{
-		StepID: "two", Seq: 2, Status: StepStatusWaiting,
+		StepID: "two", Status: StepStatusWaiting,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +139,100 @@ func TestLoadJournal_CacheAndSignals(t *testing.T) {
 	}
 }
 
+func TestLoadJournal_RunningStatusExcludedFromCache(t *testing.T) {
+	dir := t.TempDir()
+	taskID, runID := "t1", "r1"
+	if err := os.MkdirAll(runDir(dir, taskID, runID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{dataDir: dir}
+	if err := e.appendStep(taskID, runID, StepRecord{
+		StepID: "stuck", Status: StepStatusRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cache, _, err := loadJournal(dir, taskID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache["stuck"]; ok {
+		t.Fatalf("StepStatusRunning must not appear in the replay map, got %+v", cache["stuck"])
+	}
+}
+
+func TestLoadStepEvents_IncludesRunningInOrderWithOffsets(t *testing.T) {
+	dir := t.TempDir()
+	taskID, runID := "t1", "r1"
+	if err := os.MkdirAll(runDir(dir, taskID, runID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{dataDir: dir}
+	if err := e.appendStep(taskID, runID, StepRecord{StepID: "a", Status: StepStatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.appendStep(taskID, runID, StepRecord{StepID: "a", Status: StepStatusCompleted, Result: []byte(`"1"`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.appendSignal(taskID, runID, "a", []byte(`"sig"`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.appendStep(taskID, runID, StepRecord{StepID: "b", Status: StepStatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := loadStepEvents(dir, taskID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("want 3 step events (signal excluded), got %d: %+v", len(events), events)
+	}
+	if events[0].StepID != "a" || events[0].Status != StepStatusRunning || events[0].Offset != 1 {
+		t.Fatalf("event 0: %+v", events[0])
+	}
+	if events[1].StepID != "a" || events[1].Status != StepStatusCompleted || events[1].Offset != 2 {
+		t.Fatalf("event 1: %+v", events[1])
+	}
+	// event index 3 is the signal (skipped in output); "b" STARTED is frame 4.
+	if events[2].StepID != "b" || events[2].Status != StepStatusRunning || events[2].Offset != 4 {
+		t.Fatalf("event 2: %+v", events[2])
+	}
+	if events[0].ByteOffset <= 0 || events[1].ByteOffset <= events[0].ByteOffset || events[2].ByteOffset <= events[1].ByteOffset {
+		t.Fatalf("byte offsets must strictly increase: %+v", events)
+	}
+}
+
+func TestJournalTail_ReflectsExistingFrames(t *testing.T) {
+	dir := t.TempDir()
+	taskID, runID := "t1", "r1"
+	if err := os.MkdirAll(runDir(dir, taskID, runID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{dataDir: dir}
+	if err := e.appendStep(taskID, runID, StepRecord{StepID: "a", Status: StepStatusCompleted, Result: []byte(`"x"`)}); err != nil {
+		t.Fatal(err)
+	}
+	e.closeJournal(taskID, runID)
+
+	count, size, err := journalTail(dir, taskID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || size <= 0 {
+		t.Fatalf("count=%d size=%d", count, size)
+	}
+
+	// Reopening must pick up the existing tail rather than resetting to 0.
+	h, err := e.getOrOpenJournal(taskID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.count != 1 || h.size != size {
+		t.Fatalf("reopened handle count=%d size=%d, want count=1 size=%d", h.count, h.size, size)
+	}
+}
+
 func TestLoadJournal_PartialTailStopsReplay(t *testing.T) {
 	dir := t.TempDir()
 	taskID, runID := "t1", "r1"
@@ -145,7 +241,7 @@ func TestLoadJournal_PartialTailStopsReplay(t *testing.T) {
 	}
 	e := &Engine{dataDir: dir}
 	if err := e.appendStep(taskID, runID, StepRecord{
-		StepID: "good", Seq: 1, Status: StepStatusCompleted, Result: []byte(`"ok"`),
+		StepID: "good", Status: StepStatusCompleted, Result: []byte(`"ok"`),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -177,10 +273,10 @@ func TestCompactJournal_PreservesLatestStepAndAllSignals(t *testing.T) {
 	taskID, runID := "t1", "r1"
 	e := &Engine{dataDir: dir}
 
-	if err := e.appendStep(taskID, runID, StepRecord{StepID: "s", Seq: 1, Status: StepStatusWaiting}); err != nil {
+	if err := e.appendStep(taskID, runID, StepRecord{StepID: "s", Status: StepStatusWaiting}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.appendStep(taskID, runID, StepRecord{StepID: "s", Seq: 1, Status: StepStatusCompleted, Result: []byte(`"done"`)}); err != nil {
+	if err := e.appendStep(taskID, runID, StepRecord{StepID: "s", Status: StepStatusCompleted, Result: []byte(`"done"`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.appendSignal(taskID, runID, "s", []byte(`"first"`)); err != nil {
@@ -206,6 +302,30 @@ func TestCompactJournal_PreservesLatestStepAndAllSignals(t *testing.T) {
 	}
 	if string(sigs[0].GetPayload()) != `"first"` || string(sigs[1].GetPayload()) != `"second"` {
 		t.Fatalf("signals: %+v", sigs)
+	}
+}
+
+func TestCompactJournal_DropsRunningEntries(t *testing.T) {
+	dir := t.TempDir()
+	taskID, runID := "t1", "r1"
+	e := &Engine{dataDir: dir}
+
+	if err := e.appendStep(taskID, runID, StepRecord{StepID: "s", Status: StepStatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.appendStep(taskID, runID, StepRecord{StepID: "s", Status: StepStatusCompleted, Result: []byte(`"done"`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.compactJournal(taskID, runID); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := loadStepEvents(dir, taskID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Status != StepStatusCompleted {
+		t.Fatalf("compact must drop STARTED entries, got %+v", events)
 	}
 }
 

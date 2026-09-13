@@ -1,10 +1,13 @@
 package durable_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -345,7 +348,7 @@ func TestRunTask_EmptyRunIDResumesOldestActive(t *testing.T) {
 	if err := durable.RegisterTask(e, "single", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		token := ""
 		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
-			token = s.StepToken()
+			token = s.StepToken(ctx)
 			return "", durable.ErrStepPending
 		}).Get(ctx)
 		return token, err
@@ -590,7 +593,7 @@ func TestGetTask_NotFound(t *testing.T) {
 	}
 }
 
-func TestLoadSteps_OrderedBySeq(t *testing.T) {
+func TestLoadSteps_ContainsAllStepsAnyOrder(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
@@ -610,11 +613,40 @@ func TestLoadSteps_OrderedBySeq(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(steps) != 2 || steps[0].StepID != "a" || steps[1].StepID != "b" {
+	if len(steps) != 2 {
 		t.Fatalf("%+v", steps)
 	}
-	if steps[0].Seq != 1 || steps[1].Seq != 2 {
-		t.Fatalf("seq %+v", steps)
+	byID := make(map[string]durable.StepRecord, len(steps))
+	for _, s := range steps {
+		byID[s.StepID] = s
+	}
+	if byID["a"].Status != durable.StepStatusCompleted || byID["b"].Status != durable.StepStatusCompleted {
+		t.Fatalf("%+v", byID)
+	}
+}
+
+func TestGetStep_ByID(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "gs", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "only", func(ctx context.Context) (string, error) {
+			return "v", nil
+		}).Get(ctx)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := durable.RunTask[string, string](context.Background(), e, "gs", "r1", "").Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rec, ok, err := e.GetStep(context.Background(), "gs", "r1", "only")
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if rec.Status != durable.StepStatusCompleted {
+		t.Fatalf("status %s", rec.Status)
+	}
+	_, ok, err = e.GetStep(context.Background(), "gs", "r1", "missing")
+	if err != nil || ok {
+		t.Fatalf("missing step should not be found: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -693,9 +725,9 @@ func TestGetTask_InvalidIDs(t *testing.T) {
 	}
 }
 
-func recvWatchSteps(t *testing.T, ch <-chan durable.StepRecord, n int, timeout time.Duration) []durable.StepRecord {
+func recvWatchSteps(t *testing.T, ch <-chan durable.StepEvent, n int, timeout time.Duration) []durable.StepEvent {
 	t.Helper()
-	out := make([]durable.StepRecord, 0, n)
+	out := make([]durable.StepEvent, 0, n)
 	deadline := time.After(timeout)
 	for len(out) < n {
 		select {
@@ -711,9 +743,15 @@ func recvWatchSteps(t *testing.T, ch <-chan durable.StepRecord, n int, timeout t
 	return out
 }
 
+// TestWatchSteps_Live gates step execution on a release channel so the test
+// can confirm the run exists (meta.json written) and attach the watch
+// before any step runs — proving events are delivered live, not just
+// replayed from a post-hoc snapshot.
 func TestWatchSteps_Live(t *testing.T) {
 	e := newTestEngine(t)
+	release := make(chan struct{})
 	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		<-release
 		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
 			return "", err
 		}
@@ -725,20 +763,39 @@ func TestWatchSteps_Live(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch, err := e.WatchSteps(context.Background(), "seq", "r", 0)
+	run := durable.RunTask[string, string](context.Background(), e, "seq", "r", "")
+	waitUntil(t, 2*time.Second, func() bool {
+		_, ok, _ := e.GetTask(context.Background(), "seq", "r")
+		return ok
+	})
+	ch, err := e.WatchSteps(context.Background(), "seq", "r", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := durable.RunTask[string, string](context.Background(), e, "seq", "r", "").Get(context.Background()); err != nil {
+	close(release)
+	if _, err := run.Get(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got := recvWatchSteps(t, ch, 2, 2*time.Second)
-	if got[0].StepID != "a" || got[0].Seq != 1 || got[1].StepID != "b" || got[1].Seq != 2 {
-		t.Fatalf("%+v", got)
+	// Each step emits STARTED then COMPLETED, so 4 events total, in order.
+	got := recvWatchSteps(t, ch, 4, 2*time.Second)
+	wantIDs := []string{"a", "a", "b", "b"}
+	wantStatus := []durable.StepStatus{durable.StepStatusRunning, durable.StepStatusCompleted, durable.StepStatusRunning, durable.StepStatusCompleted}
+	for i, ev := range got {
+		if ev.StepID != wantIDs[i] || ev.Status != wantStatus[i] {
+			t.Fatalf("event %d: got %+v, want stepID=%s status=%s", i, ev, wantIDs[i], wantStatus[i])
+		}
+		if i > 0 && ev.Offset <= got[i-1].Offset {
+			t.Fatalf("offsets must strictly increase: %+v", got)
+		}
 	}
 }
 
-func TestWatchSteps_FromSeq(t *testing.T) {
+// TestWatchSteps_FromOffset and TestWatchSteps_FromByteOffset use a run
+// that ends on a still-pending step, so the journal is never compacted —
+// compactJournal (terminal runs only) collapses each step to its latest
+// record and drops STARTED entries, which would otherwise make history
+// unavailable to a reconnecting watcher.
+func TestWatchSteps_FromOffset(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
@@ -747,21 +804,72 @@ func TestWatchSteps_FromSeq(t *testing.T) {
 		if _, err := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "2", nil }).Get(ctx); err != nil {
 			return "", err
 		}
-		return "ok", nil
+		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+			return "", durable.ErrStepPending
+		}).Get(ctx)
+		return "ok", err
 	})); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := durable.RunTask[string, string](context.Background(), e, "seq", "r", "").Get(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	run := durable.RunTask[string, string](context.Background(), e, "seq", "r", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
 
-	ch, err := e.WatchSteps(context.Background(), "seq", "r", 1)
+	// Skip the first two events (a STARTED, a COMPLETED) via fromOffset.
+	ch, err := e.WatchSteps(context.Background(), "seq", "r", 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := recvWatchSteps(t, ch, 1, 2*time.Second)
-	if got[0].StepID != "b" || got[0].Seq != 2 {
-		t.Fatalf("%+v", got)
+	got := recvWatchSteps(t, ch, 2, 2*time.Second)
+	if got[0].StepID != "b" || got[0].Status != durable.StepStatusRunning {
+		t.Fatalf("%+v", got[0])
+	}
+	if got[1].StepID != "b" || got[1].Status != durable.StepStatusCompleted {
+		t.Fatalf("%+v", got[1])
+	}
+}
+
+func TestWatchSteps_FromByteOffset(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
+			return "", err
+		}
+		if _, err := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "2", nil }).Get(ctx); err != nil {
+			return "", err
+		}
+		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+			return "", durable.ErrStepPending
+		}).Get(ctx)
+		return "ok", err
+	})); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](context.Background(), e, "seq", "r", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
+
+	// Full history first, to learn the byte offset right after "a" COMPLETED.
+	full, err := e.WatchSteps(context.Background(), "seq", "r", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTwo := recvWatchSteps(t, full, 2, 2*time.Second)
+	resumeAt := firstTwo[1].ByteOffset
+
+	ch, err := e.WatchSteps(context.Background(), "seq", "r", 0, resumeAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := recvWatchSteps(t, ch, 2, 2*time.Second)
+	if got[0].StepID != "b" || got[0].Status != durable.StepStatusRunning {
+		t.Fatalf("fromByteOffset should skip straight past %q, got %+v", "a", got[0])
+	}
+}
+
+func TestWatchSteps_RunNotFound(t *testing.T) {
+	e := newTestEngine(t)
+	_, err := e.WatchSteps(context.Background(), "missing", "r1", 0, 0)
+	if err == nil {
+		t.Fatal("expected error for non-existent run")
 	}
 }
 
@@ -772,11 +880,13 @@ func TestWatchSteps_CancelClosesChannel(t *testing.T) {
 	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ch, err := e.WatchSteps(ctx, "approve", "r1", 0)
+	ch, err := e.WatchSteps(ctx, "approve", "r1", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = recvWatchSteps(t, ch, 1, 2*time.Second)
+	// STARTED then WAITING — drain both before cancelling so the close
+	// check below cannot instead observe an already-buffered event.
+	_ = recvWatchSteps(t, ch, 2, 2*time.Second)
 	cancel()
 	select {
 	case _, ok := <-ch:
@@ -794,16 +904,21 @@ func TestWatchSteps_CancelClosesChannel(t *testing.T) {
 func TestWatchSteps_WaitingThenCompleted(t *testing.T) {
 	e := newTestEngine(t)
 	registerApproval(t, e, nil)
-	ch, err := e.WatchSteps(context.Background(), "approve", "r1", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 	run := durable.RunTask[string, approval](context.Background(), e, "approve", "r1", "")
 	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
 
-	first := recvWatchSteps(t, ch, 1, 2*time.Second)
-	if first[0].StepID != "approve" || first[0].Status != durable.StepStatusWaiting {
-		t.Fatalf("waiting %+v", first[0])
+	ch, err := e.WatchSteps(context.Background(), "approve", "r1", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// STARTED, then WAITING.
+	first := recvWatchSteps(t, ch, 2, 2*time.Second)
+	if first[0].StepID != "approve" || first[0].Status != durable.StepStatusRunning {
+		t.Fatalf("started %+v", first[0])
+	}
+	if first[1].StepID != "approve" || first[1].Status != durable.StepStatusWaiting {
+		t.Fatalf("waiting %+v", first[1])
 	}
 
 	token := encodeTestToken("approve", "r1", "approve")
@@ -824,10 +939,19 @@ func TestWatchSteps_EngineCloseClosesChannel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ch, err := e.WatchSteps(context.Background(), "t", "r", 0)
+	if err := durable.RegisterTask(e, "t", identityTask()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := durable.RunTask[string, string](context.Background(), e, "t", "r", "x").Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ch, err := e.WatchSteps(context.Background(), "t", "r", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Drain the one buffered snapshot event (the completed "echo" step)
+	// before checking that Close terminates the watch.
+	_ = recvWatchSteps(t, ch, 1, 2*time.Second)
 	if err := e.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -839,4 +963,68 @@ func TestWatchSteps_EngineCloseClosesChannel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("watch did not close after Engine.Close")
 	}
+}
+
+// TestWatchSteps_SlowConsumerDropLogsWarning fills the watch buffer past
+// capacity with a consumer that never reads, then verifies the run still
+// completes (notifyStepWatchers must not block on a full channel) and that
+// a drop warning was logged.
+func TestWatchSteps_SlowConsumerDropLogsWarning(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	e := newTestEngine(t, durable.WithLogger(logger))
+
+	const nSteps = 200 // watchStepsBuf is 64; each step emits 2 events.
+	release := make(chan struct{})
+	if err := durable.RegisterTask(e, "slowwatch", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		<-release
+		for i := 0; i < nSteps; i++ {
+			id := fmt.Sprintf("s%d", i)
+			if _, err := durable.RunStep(ctx, s, id, func(ctx context.Context) (string, error) { return "ok", nil }).Get(ctx); err != nil {
+				return "", err
+			}
+		}
+		return "done", nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	run := durable.RunTask[string, string](context.Background(), e, "slowwatch", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool {
+		_, ok, _ := e.GetTask(context.Background(), "slowwatch", "r1")
+		return ok
+	})
+	// Register the watch but never read from it — a slow/absent consumer.
+	if _, err := e.WatchSteps(context.Background(), "slowwatch", "r1", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+
+	out, err := run.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "done" {
+		t.Fatalf("got %q", out)
+	}
+	if !strings.Contains(logBuf.String(), "consumer too slow") {
+		t.Fatal("expected a slow-consumer drop warning to be logged")
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

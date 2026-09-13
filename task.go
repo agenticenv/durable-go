@@ -482,11 +482,13 @@ func (e *Engine) executeRun(ctx context.Context, taskID, runID string, entry tas
 	}
 	cache := make(map[string]StepRecord, len(steps))
 	for id, rec := range steps {
-		if rec.Status == StepStatusCompleted {
+		switch rec.Status {
+		case StepStatusCompleted, StepStatusFailed:
+			// FAILED must replay here too — a step that failed before a
+			// crash must not re-run fn on resume; RunStep returns the
+			// stored error from cache instead.
 			cache[id] = rec
-			continue
-		}
-		if rec.Status == StepStatusWaiting {
+		case StepStatusWaiting:
 			if payload, ok := signals[id]; ok {
 				rec.Status = StepStatusCompleted
 				rec.Result = payload
@@ -520,6 +522,14 @@ func (e *Engine) executeRun(ctx context.Context, taskID, runID string, entry tas
 			logger.Warn("task retrying", "attempt", attempt, "error", taskErr)
 		}
 		output, panicTrace, taskErr = invokeTask(ctx, runner, entry, input)
+		// The task closure has returned, but sibling RunStep goroutines it
+		// started and never Get-ed (or started fanning out but returned
+		// early on one error) may still be running. Wait for them before
+		// deciding the attempt's outcome or retrying — otherwise a retry's
+		// fresh StepRunner could race the previous attempt's stragglers on
+		// the same journal, and Close/compactJournal could run concurrently
+		// with an in-flight append.
+		runner.waitInFlight()
 		if taskErr == nil {
 			break
 		}
@@ -605,8 +615,10 @@ func (e *Engine) GetTask(ctx context.Context, taskID, runID string) (TaskInfo, b
 	return loadMeta(e.dataDir, taskID, runID)
 }
 
-// LoadSteps returns all StepRecords for a run ordered by Seq. Used to
-// inspect progress. Includes waiting, completed, and failed steps.
+// LoadSteps returns all StepRecords for a run. Used to inspect progress.
+// Includes waiting, completed, and failed steps. Order is not sorted or
+// otherwise guaranteed — it reflects map iteration order internally. Use
+// WatchSteps if you need append order or history.
 func (e *Engine) LoadSteps(ctx context.Context, taskID, runID string) ([]StepRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -620,13 +632,80 @@ func (e *Engine) LoadSteps(ctx context.Context, taskID, runID string) ([]StepRec
 	return loadStepRecords(e.dataDir, taskID, runID)
 }
 
+// GetStep returns the latest StepRecord for one stepID in O(1) after one
+// journal load — (zero, false, nil) if the run has no record for that
+// stepID yet (including one stuck mid-execution: an unfinished STARTED
+// step never appears here — see loadJournal).
+func (e *Engine) GetStep(ctx context.Context, taskID, runID, stepID string) (StepRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return StepRecord{}, false, err
+	}
+	if err := validateTaskID(taskID); err != nil {
+		return StepRecord{}, false, err
+	}
+	if err := validateRunID(runID); err != nil {
+		return StepRecord{}, false, err
+	}
+	if stepID == "" {
+		return StepRecord{}, false, fmt.Errorf("durable: step ID must not be empty")
+	}
+	steps, _, err := e.loadJournal(taskID, runID)
+	if err != nil {
+		return StepRecord{}, false, err
+	}
+	rec, ok := steps[stepID]
+	return rec, ok, nil
+}
+
+// GetStep returns the latest StepRecord for one stepID. Same semantics as
+// Engine.GetStep.
+func (r *ReadOnlyEngine) GetStep(ctx context.Context, taskID, runID, stepID string) (StepRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return StepRecord{}, false, err
+	}
+	if err := validateTaskID(taskID); err != nil {
+		return StepRecord{}, false, err
+	}
+	if err := validateRunID(runID); err != nil {
+		return StepRecord{}, false, err
+	}
+	if stepID == "" {
+		return StepRecord{}, false, fmt.Errorf("durable: step ID must not be empty")
+	}
+	steps, _, err := loadJournal(r.dataDir, taskID, runID)
+	if err != nil {
+		return StepRecord{}, false, err
+	}
+	rec, ok := steps[stepID]
+	return rec, ok, nil
+}
+
 const watchStepsBuf = 64
 
-// WatchSteps streams step events for a run. fromSeq is the offset (0 = from
-// the start). Already-written steps after that seq are sent first, then each
-// new step as it is persisted. The channel closes when ctx is cancelled or
-// the engine closes. Cancelling ctx does not stop the run.
-func (e *Engine) WatchSteps(ctx context.Context, taskID, runID string, fromSeq int) (<-chan StepRecord, error) {
+// StepEvent is one journal entry delivered by WatchSteps: STARTED (running),
+// WAITING, COMPLETED, or FAILED — every append, in journal order (never
+// last-write-wins). Offset is the 1-based position of this event across the
+// run's whole journal (steps and signals share one counter); ByteOffset is
+// the file position immediately after it. Reconnect with either value as
+// fromOffset/fromByteOffset to resume a watch without missing or repeating
+// events; byteOffset skips a full rescan, offset does not.
+type StepEvent struct {
+	StepRecord
+	Offset     int
+	ByteOffset int64
+}
+
+// WatchSteps streams step lifecycle events for a run: STARTED, WAITING,
+// COMPLETED, FAILED — every append, in journal order. fromOffset (event
+// count) or fromByteOffset (file position) skip already-seen history;
+// fromByteOffset takes priority when non-zero (pass 0 for fromOffset if you
+// only have a byte offset). Already-written events after that point are
+// sent first, then each new event as it is persisted. The channel closes
+// when ctx is cancelled or the engine closes; cancelling the watch does not
+// stop the run. A slow consumer may miss live events — a warning is logged
+// and delivery continues; reconnect with the last Offset/ByteOffset seen to
+// catch up from the journal.
+func (e *Engine) WatchSteps(ctx context.Context, taskID, runID string, fromOffset int, fromByteOffset int64) (<-chan StepEvent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -636,64 +715,63 @@ func (e *Engine) WatchSteps(ctx context.Context, taskID, runID string, fromSeq i
 	if err := validateRunID(runID); err != nil {
 		return nil, err
 	}
+	if _, ok, err := e.loadMeta(taskID, runID); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, fmt.Errorf("durable: run %s/%s not found", taskID, runID)
+	}
 
-	notify := make(chan StepRecord, watchStepsBuf)
+	notify := make(chan StepEvent, watchStepsBuf)
 	e.addStepWatcher(taskID, runID, notify)
-	recs, err := loadStepRecords(e.dataDir, taskID, runID)
+	events, err := e.loadStepEvents(taskID, runID)
 	if err != nil {
 		e.removeStepWatcher(taskID, runID, notify)
 		return nil, err
 	}
-	out := make(chan StepRecord, watchStepsBuf)
-	go e.runStepWatch(ctx, taskID, runID, fromSeq, recs, notify, out)
+	out := make(chan StepEvent, watchStepsBuf)
+	go e.runStepWatch(ctx, taskID, runID, fromOffset, fromByteOffset, events, notify, out)
 	return out, nil
 }
 
-// watchCursor drops exact duplicates (same seq+step+status) but keeps a
-// later status on the same seq — waiting then completed share Seq.
-type watchCursor struct {
-	seq    int
-	stepID string
-	status StepStatus
+// watchStartOffset resolves the initial cursor from either an event-count
+// offset or a byte offset (byte offset wins when non-zero): the returned
+// cursor is the Offset of the last event the caller has already seen.
+func watchStartOffset(fromOffset int, fromByteOffset int64, events []StepEvent) int {
+	if fromByteOffset <= 0 {
+		return fromOffset
+	}
+	cursor := 0
+	for _, ev := range events {
+		if ev.ByteOffset <= fromByteOffset {
+			cursor = ev.Offset
+		}
+	}
+	return cursor
 }
 
-func (c *watchCursor) take(rec StepRecord) bool {
-	if rec.Seq < c.seq {
-		return false
-	}
-	if rec.Seq == c.seq && rec.StepID == c.stepID && rec.Status == c.status {
-		return false
-	}
-	c.seq = rec.Seq
-	c.stepID = rec.StepID
-	c.status = rec.Status
-	return true
-}
-
-func (e *Engine) runStepWatch(ctx context.Context, taskID, runID string, fromSeq int, recs []StepRecord, notify, out chan StepRecord) {
+func (e *Engine) runStepWatch(ctx context.Context, taskID, runID string, fromOffset int, fromByteOffset int64, events []StepEvent, notify, out chan StepEvent) {
 	defer close(out)
 	defer e.removeStepWatcher(taskID, runID, notify)
 
-	cur := watchCursor{seq: fromSeq}
-	for _, rec := range recs {
-		if rec.Seq <= fromSeq {
+	cursor := watchStartOffset(fromOffset, fromByteOffset, events)
+	for _, ev := range events {
+		if ev.Offset <= cursor {
 			continue
 		}
-		if !cur.take(rec) {
-			continue
-		}
-		if !sendStepWatch(ctx, e.stopCh, out, rec) {
+		cursor = ev.Offset
+		if !sendStepWatch(ctx, e.stopCh, out, ev) {
 			return
 		}
 	}
 
 	for {
 		select {
-		case rec := <-notify:
-			if !cur.take(rec) {
+		case ev := <-notify:
+			if ev.Offset <= cursor {
 				continue
 			}
-			if !sendStepWatch(ctx, e.stopCh, out, rec) {
+			cursor = ev.Offset
+			if !sendStepWatch(ctx, e.stopCh, out, ev) {
 				return
 			}
 		case <-ctx.Done():
@@ -704,9 +782,9 @@ func (e *Engine) runStepWatch(ctx context.Context, taskID, runID string, fromSeq
 	}
 }
 
-func sendStepWatch(ctx context.Context, stopCh <-chan struct{}, out chan StepRecord, rec StepRecord) bool {
+func sendStepWatch(ctx context.Context, stopCh <-chan struct{}, out chan StepEvent, ev StepEvent) bool {
 	select {
-	case out <- rec:
+	case out <- ev:
 		return true
 	case <-ctx.Done():
 		return false
@@ -715,16 +793,16 @@ func sendStepWatch(ctx context.Context, stopCh <-chan struct{}, out chan StepRec
 	}
 }
 
-func (e *Engine) addStepWatcher(taskID, runID string, ch chan StepRecord) {
+func (e *Engine) addStepWatcher(taskID, runID string, ch chan StepEvent) {
 	key := taskID + "/" + runID
-	actual, _ := e.watchers.LoadOrStore(key, &stepWatchSet{chs: make(map[chan StepRecord]struct{})})
+	actual, _ := e.watchers.LoadOrStore(key, &stepWatchSet{chs: make(map[chan StepEvent]struct{})})
 	s := actual.(*stepWatchSet)
 	s.mu.Lock()
 	s.chs[ch] = struct{}{}
 	s.mu.Unlock()
 }
 
-func (e *Engine) removeStepWatcher(taskID, runID string, ch chan StepRecord) {
+func (e *Engine) removeStepWatcher(taskID, runID string, ch chan StepEvent) {
 	key := taskID + "/" + runID
 	v, ok := e.watchers.Load(key)
 	if !ok {
@@ -740,22 +818,29 @@ func (e *Engine) removeStepWatcher(taskID, runID string, ch chan StepRecord) {
 	}
 }
 
-func (e *Engine) notifyStepWatchers(taskID, runID string, rec StepRecord) {
+// notifyStepWatchers fans ev out to every live watcher for this run. A
+// watcher whose buffer is full (a slow consumer) is skipped rather than
+// blocked — the drop is logged so the consumer knows to reconnect with the
+// last Offset/ByteOffset it did see; the channel itself is left open so a
+// momentary burst does not force a reconnect.
+func (e *Engine) notifyStepWatchers(taskID, runID string, ev StepEvent) {
 	v, ok := e.watchers.Load(taskID + "/" + runID)
 	if !ok {
 		return
 	}
 	s := v.(*stepWatchSet)
 	s.mu.Lock()
-	chs := make([]chan StepRecord, 0, len(s.chs))
+	chs := make([]chan StepEvent, 0, len(s.chs))
 	for ch := range s.chs {
 		chs = append(chs, ch)
 	}
 	s.mu.Unlock()
 	for _, ch := range chs {
 		select {
-		case ch <- rec:
+		case ch <- ev:
 		default:
+			e.cfg.logger.Warn("watch step dropped: consumer too slow",
+				"task_id", taskID, "run_id", runID, "step_id", ev.StepID, "offset", ev.Offset)
 		}
 	}
 }
@@ -931,6 +1016,5 @@ func loadStepRecords(dataDir, taskID, runID string) ([]StepRecord, error) {
 	for _, rec := range steps {
 		recs = append(recs, rec)
 	}
-	sort.Slice(recs, func(i, j int) bool { return recs[i].Seq < recs[j].Seq })
 	return recs, nil
 }

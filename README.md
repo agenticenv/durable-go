@@ -15,13 +15,18 @@
 ## Features
 
 - **Engine API** — `NewEngine`, `RegisterTask`, `RunTask`, `RunStep` in a single package.
-- **Memoized steps** — completed steps replay from the journal; they are not run again.
-- **Pending steps** — return `ErrStepPending` and complete later via `CompleteStep` (human approval, webhooks).
+- **Async fan-out** — `RunStep` starts work and returns immediately, matching `RunTask`; call several before `Get`-ing any of them.
+- **First-of-N** — `StepRun.Done()` exposes a read-only channel so you can `select` across handles and react to whichever finishes first.
+- **Memoized steps** — completed steps replay from the journal; they are not run again. Failed steps replay their stored error instead of re-running `fn`.
+- **Pending steps** — return `ErrStepPending` and complete later via `CompleteStep` (human approval, webhooks). Suspends only that step's `Get`, not the whole task — sibling steps keep running.
 - **Fire-and-forget runs** — `RunTask` returns immediately; `TaskRun.Get` waits; `RunID()` is available at once.
+- **Step observability** — `GetStep` / `LoadSteps` for current state, `WatchSteps` for a live/historical event stream (including STARTED).
 - **Timeouts and retries** — engine / task / run / step options. Retries default to 0 (opt-in).
 - **Panic recovery** — task and step panics are recorded and returned as errors.
 - **Auto-purge** — optional background cleanup of old completed and failed runs.
 - **Flexible execution** — tasks as `durable.Func` closures or structs with `Exec`.
+
+> **Pre-1.0.** This is the first fully worked-through release of the step model (see [Resume](#resume) and [Writing tasks](#writing-tasks)); the on-disk journal format changed in this release and is not compatible with runs written by `v0.1.0`–`v0.1.2`. Upgrade only between clean runs.
 
 ## Why durable-go
 
@@ -96,11 +101,11 @@ Full example: [`examples/struct-task/`](examples/struct-task/).
 
 ### Pending steps
 
-A step suspends itself by returning `ErrStepPending`. An external caller completes it with the token from `StepToken()`:
+A step suspends itself by returning `ErrStepPending`. This blocks only that step's `Get` — sibling steps started before it keep running. An external caller completes it with the token from `StepToken(ctx)`:
 
 ```go
 approval, err := durable.RunStep(ctx, s, "approve", func(ctx context.Context) (Approval, error) {
-    token := s.StepToken()
+    token := s.StepToken(ctx)
     sendEmail("manager@co.com", token)
     return Approval{}, durable.ErrStepPending
 }).Get(ctx)
@@ -108,6 +113,39 @@ approval, err := durable.RunStep(ctx, s, "approve", func(ctx context.Context) (A
 // webhook / CLI / another goroutine:
 durable.CompleteStep(ctx, e, token, Approval{By: "manager@co.com"})
 ```
+
+### Fan-out and first-of-N
+
+`RunStep` starts work and returns immediately — the same shape as `RunTask`. Start several steps before calling `Get` on any of them to run them concurrently, then join:
+
+```go
+charge := durable.RunStep(ctx, s, "charge", func(ctx context.Context) (string, error) {
+    return chargeCard(order)
+})
+notify := durable.RunStep(ctx, s, "notify", func(ctx context.Context) (string, error) {
+    return sendReceipt(order)
+})
+chargeResult, err := charge.Get(ctx)
+if err != nil {
+    return Output{}, err
+}
+notifyResult, err := notify.Get(ctx)
+```
+
+To react to whichever of several steps finishes first, `select` on `Done()` instead of blocking on `Get`:
+
+```go
+a := durable.RunStep(ctx, s, "provider-a", callProviderA)
+b := durable.RunStep(ctx, s, "provider-b", callProviderB)
+select {
+case <-a.Done():
+    result, err := a.Get(ctx)
+case <-b.Done():
+    result, err := b.Get(ctx)
+}
+```
+
+Full example: [`examples/fanout/`](examples/fanout/).
 
 ## Resume
 
@@ -124,7 +162,7 @@ for _, t := range pending {
 
 `RunTask` writes `input.json` on first start. The same runID reloads it; the input argument is ignored.
 
-`WatchSteps` streams step events for a run (from a seq, then live as each step is written). Cancelling the watch does not stop the run.
+`GetStep` and `LoadSteps` return current state — the latest record per step, in-memory-map order (not sorted). `WatchSteps` returns history and live updates instead: every STARTED, WAITING, COMPLETED, and FAILED event in the order it was written, either from the beginning (`fromOffset` 0) or resuming past a previously-seen `Offset` / `ByteOffset`. Cancelling the watch does not stop the run. A watch that falls behind may have events dropped (logged as a warning) rather than blocking the run — reconnect with the last `Offset`/`ByteOffset` you saw to catch up.
 
 Full example: [`examples/resume/`](examples/resume/).
 
@@ -139,7 +177,8 @@ Follow these when you write a task. On resume, the task runs again from the top;
 Also:
 
 - **Unique step IDs** — one stable string per step (literals or `fmt.Sprintf("step-%d", i)`). Reusing an ID panics.
-- **Sequential `RunStep` calls** — concurrent calls on the same `StepRunner` panic. Fan out work, then persist results sequentially.
+- **Step IDs are the resume key — never rename one.** The journal matches records by stepID string only. Renaming a step between deploys orphans the old result: on the next run `fn` executes again under the new name as if it had never run. Treat a stepID like a database column name, not a display label.
+- **Concurrent `RunStep` calls are safe.** Start several steps before `Get`-ing any of them to fan out; join with `Get` or `select` on `Done()`. A duplicate stepID within one run still panics.
 - **JSON results** — step and task outputs must be JSON-marshalable.
 - **Same runID to resume** — `input.json` is reloaded; you do not need to pass the original input again.
 
@@ -152,12 +191,14 @@ Runnable examples in [examples/](examples/) — see [examples/README.md](example
 | [`examples/resume/`](examples/resume/) | Crash after step 2, resume from cache |
 | [`examples/func-task/`](examples/func-task/) | Closure-style `durable.Func` |
 | [`examples/struct-task/`](examples/struct-task/) | Struct task with injected deps, retries, timeout |
+| [`examples/fanout/`](examples/fanout/) | Concurrent `RunStep`, `Get`-all join, `ErrStepPending` |
 
 ```bash
 # from repo root
 go run ./examples/resume/
 go run ./examples/func-task/
 go run ./examples/struct-task/
+go run ./examples/fanout/
 ```
 
 ## Development

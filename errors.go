@@ -30,9 +30,11 @@ var (
 	// another OS process) and the lock cannot be acquired before the timeout.
 	ErrEngineLocked = errors.New("durable: dataDir locked by another engine")
 
-	// ErrStepPending is returned from a step function to suspend the run
-	// until CompleteStep delivers a result for that step. The engine writes
-	// StepStatusWaiting and blocks the run goroutine.
+	// ErrStepPending is returned from a step function to suspend that step
+	// until CompleteStep delivers a result for it. The engine writes
+	// StepStatusWaiting and blocks that step's Get — not the whole task.
+	// Sibling steps started before this one keep running; call Get on them
+	// independently or select on their Done channels.
 	ErrStepPending = errors.New("durable: step pending external completion")
 
 	// ErrInvalidToken is returned by CompleteStep when the token cannot be

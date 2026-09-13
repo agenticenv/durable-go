@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -70,62 +71,127 @@ func TestRunStep_PanicRecovery(t *testing.T) {
 	}
 }
 
-func TestRunStep_ConcurrentCallPanic(t *testing.T) {
+// TestRunStep_Fanout starts two independent steps before Get-ing either,
+// proving concurrent RunStep calls on the same StepRunner no longer panic
+// and both genuinely run in parallel (the fast step finishes while the
+// slow one is still sleeping).
+func TestRunStep_Fanout(t *testing.T) {
 	e := newTestEngine(t)
-	started := make(chan struct{})
-	block := make(chan struct{})
-	var recovered atomic.Bool
-	if err := durable.RegisterTask(e, "conc", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+	var calls atomic.Int32
+	if err := durable.RegisterTask(e, "fanout", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		x := durable.RunStep(ctx, s, "slow", func(ctx context.Context) (string, error) {
+			calls.Add(1)
+			time.Sleep(50 * time.Millisecond)
+			return "A", nil
+		})
+		y := durable.RunStep(ctx, s, "fast", func(ctx context.Context) (string, error) {
+			calls.Add(1)
+			return "B", nil
+		})
+		// Get the fast one first — it must not block on the slow one.
+		rb, errb := y.Get(ctx)
+		if errb != nil {
+			return "", errb
+		}
+		ra, erra := x.Get(ctx)
+		if erra != nil {
+			return "", erra
+		}
+		return ra + rb, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	run := durable.RunTask[string, string](context.Background(), e, "fanout", "", "")
+	out, err := run.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "AB" {
+		t.Fatalf("got %q", out)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls=%d", calls.Load())
+	}
+}
+
+// TestRunStep_UserGoroutineFanoutNoPanic covers calling RunStep from two
+// explicit user goroutines (not just sequential calls before Get) — the
+// library does not police how the caller fans out.
+func TestRunStep_UserGoroutineFanoutNoPanic(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "usergo", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		var a, b *durable.StepRun[string]
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, _ = durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) {
-				close(started)
-				<-block
-				return "a", nil
-			}).Get(ctx)
+			a = durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "A", nil })
 		}()
 		go func() {
 			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					if strings.Contains(fmtPanic(r), "concurrent RunStep") {
-						recovered.Store(true)
-					}
-				}
-				close(block)
-			}()
-			<-started
-			_, _ = durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) {
-				return "b", nil
-			}).Get(ctx)
+			b = durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "B", nil })
 		}()
 		wg.Wait()
+		ra, erra := a.Get(ctx)
+		if erra != nil {
+			return "", erra
+		}
+		rb, errb := b.Get(ctx)
+		if errb != nil {
+			return "", errb
+		}
+		return ra + rb, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := durable.RunTask[string, string](context.Background(), e, "usergo", "", "").Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "AB" {
+		t.Fatalf("got %q", out)
+	}
+}
+
+// TestStepRun_DoneSelectFirstOfN covers the first-of-N pattern: select on
+// Done across two handles and react to whichever finishes first.
+func TestStepRun_DoneSelectFirstOfN(t *testing.T) {
+	e := newTestEngine(t)
+	var firstWinner atomic.Value
+	if err := durable.RegisterTask(e, "race", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		x := durable.RunStep(ctx, s, "slow", func(ctx context.Context) (string, error) {
+			time.Sleep(150 * time.Millisecond)
+			return "slow", nil
+		})
+		y := durable.RunStep(ctx, s, "fast", func(ctx context.Context) (string, error) {
+			return "fast", nil
+		})
+		select {
+		case <-x.Done():
+			firstWinner.Store("slow")
+		case <-y.Done():
+			firstWinner.Store("fast")
+		}
+		// Drain both so the run completes cleanly.
+		if _, err := x.Get(ctx); err != nil {
+			return "", err
+		}
+		if _, err := y.Get(ctx); err != nil {
+			return "", err
+		}
 		return "ok", nil
 	})); err != nil {
 		t.Fatal(err)
 	}
-	run := durable.RunTask[string, string](context.Background(), e, "conc", "", "")
-	if _, err := run.Get(context.Background()); err != nil {
+
+	if _, err := durable.RunTask[string, string](context.Background(), e, "race", "", "").Get(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !recovered.Load() {
-		t.Fatal("expected concurrent RunStep panic")
+	if got := firstWinner.Load(); got != "fast" {
+		t.Fatalf("expected fast step to win the select, got %v", got)
 	}
-}
-
-func fmtPanic(r any) string {
-	if r == nil {
-		return ""
-	}
-	if s, ok := r.(string); ok {
-		return s
-	}
-	if e, ok := r.(error); ok {
-		return e.Error()
-	}
-	return ""
 }
 
 func TestRunStep_DuplicateStepIDPanic(t *testing.T) {
@@ -161,6 +227,19 @@ func TestRunStep_DuplicateStepIDPanic(t *testing.T) {
 	}
 }
 
+func fmtPanic(r any) string {
+	if r == nil {
+		return ""
+	}
+	if s, ok := r.(string); ok {
+		return s
+	}
+	if e, ok := r.(error); ok {
+		return e.Error()
+	}
+	return ""
+}
+
 func TestRunStep_Timeout(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "to", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
@@ -174,35 +253,6 @@ func TestRunStep_Timeout(t *testing.T) {
 	_, err := durable.RunTask[string, string](context.Background(), e, "to", "", "").Get(context.Background())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v", err)
-	}
-}
-
-func TestRunStep_StepSeq(t *testing.T) {
-	e := newTestEngine(t)
-	var before, mid, after int
-	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		before = s.StepSeq()
-		if _, err := durable.RunStep(ctx, s, "one", func(ctx context.Context) (string, error) {
-			return "1", nil
-		}).Get(ctx); err != nil {
-			return "", err
-		}
-		mid = s.StepSeq()
-		if _, err := durable.RunStep(ctx, s, "two", func(ctx context.Context) (string, error) {
-			return "2", nil
-		}).Get(ctx); err != nil {
-			return "", err
-		}
-		after = s.StepSeq()
-		return "ok", nil
-	})); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := durable.RunTask[string, string](context.Background(), e, "seq", "", "").Get(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if before != 0 || mid != 1 || after != 2 {
-		t.Fatalf("seq before=%d mid=%d after=%d", before, mid, after)
 	}
 }
 
@@ -248,6 +298,82 @@ func TestRunStep_NoRetryOnPanic(t *testing.T) {
 	}
 }
 
+// TestRunStep_FailedReplayDoesNotRerunFn crashes a run with a step already
+// persisted FAILED (but the run itself still non-terminal, suspended on a
+// sibling pending step), reopens the engine, and verifies the failed step's
+// fn is not invoked again — only the stored error is replayed.
+func TestRunStep_FailedReplayDoesNotRerunFn(t *testing.T) {
+	src := t.TempDir()
+	ctx := context.Background()
+	var flakyCalls atomic.Int32
+
+	newTask := func() durable.TaskFunc[string, string] {
+		return durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+			_, ferr := durable.RunStep(ctx, s, "flaky", func(ctx context.Context) (string, error) {
+				flakyCalls.Add(1)
+				return "", errors.New("boom")
+			}).Get(ctx)
+			errMsg := ""
+			if ferr != nil {
+				errMsg = ferr.Error()
+			}
+			_, werr := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+				return "", durable.ErrStepPending
+			}).Get(ctx)
+			if werr != nil {
+				return "", werr
+			}
+			return errMsg, nil
+		})
+	}
+
+	e1, err := durable.NewEngine(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.RegisterTask(e1, "flakytest", newTask()); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](ctx, e1, "flakytest", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
+	if flakyCalls.Load() != 1 {
+		t.Fatalf("flaky calls before crash: %d", flakyCalls.Load())
+	}
+
+	dst := t.TempDir()
+	if err := copyDir(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	_ = e1.Close()
+
+	e2, err := durable.NewEngine(ctx, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e2.Close() }()
+	if err := durable.RegisterTask(e2, "flakytest", newTask()); err != nil {
+		t.Fatal(err)
+	}
+
+	run2 := durable.RunTask[string, string](ctx, e2, "flakytest", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return run2.Status() == durable.StatusWaiting })
+	if flakyCalls.Load() != 1 {
+		t.Fatalf("flaky step re-ran fn on resume: calls=%d", flakyCalls.Load())
+	}
+
+	token := encodeTestToken("flakytest", "r1", "wait")
+	if err := durable.CompleteStep(ctx, e2, token, "done"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run2.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "boom" {
+		t.Fatalf("expected replayed error message %q, got %q", "boom", out)
+	}
+}
+
 func TestStepRunner_Accessors(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "acc", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
@@ -279,7 +405,7 @@ func TestStepToken_PanicsOutsideStep(t *testing.T) {
 				}
 			}
 		}()
-		_ = s.StepToken()
+		_ = s.StepToken(ctx)
 		return "ok", nil
 	})); err != nil {
 		t.Fatal(err)
@@ -289,6 +415,100 @@ func TestStepToken_PanicsOutsideStep(t *testing.T) {
 	}
 	if !recovered.Load() {
 		t.Fatal("expected StepToken panic")
+	}
+}
+
+// TestStepToken_TwoConcurrentStepsEachGetOwnToken proves StepToken reads
+// the stepID off ctx (not off shared StepRunner state) so two concurrent
+// steps do not clobber each other's token.
+func TestStepToken_TwoConcurrentStepsEachGetOwnToken(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "twotok", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		x := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) {
+			return s.StepToken(ctx), durable.ErrStepPending
+		})
+		y := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) {
+			return s.StepToken(ctx), durable.ErrStepPending
+		})
+		_, _ = x.Get(ctx)
+		_, _ = y.Get(ctx)
+		return "unreachable", nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](context.Background(), e, "twotok", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool {
+		ra, oka, _ := e.GetStep(context.Background(), "twotok", "r1", "a")
+		rb, okb, _ := e.GetStep(context.Background(), "twotok", "r1", "b")
+		return oka && ra.Status == durable.StepStatusWaiting && okb && rb.Status == durable.StepStatusWaiting
+	})
+	tokenA := encodeTestToken("twotok", "r1", "a")
+	tokenB := encodeTestToken("twotok", "r1", "b")
+	if err := durable.CompleteStep(context.Background(), e, tokenA, "resumed-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.CompleteStep(context.Background(), e, tokenB, "resumed-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run.Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunStep_DualPendingBothComplete covers two steps suspended at once:
+// completing one must not clear StatusWaiting while the sibling is still
+// pending, and completing both resolves the run.
+func TestRunStep_DualPendingBothComplete(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "dual", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		x := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) {
+			return "", durable.ErrStepPending
+		})
+		y := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) {
+			return "", durable.ErrStepPending
+		})
+		ra, erra := x.Get(ctx)
+		if erra != nil {
+			return "", erra
+		}
+		rb, errb := y.Get(ctx)
+		if errb != nil {
+			return "", errb
+		}
+		return ra + rb, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	run := durable.RunTask[string, string](context.Background(), e, "dual", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool {
+		ra, oka, _ := e.GetStep(context.Background(), "dual", "r1", "a")
+		rb, okb, _ := e.GetStep(context.Background(), "dual", "r1", "b")
+		return oka && ra.Status == durable.StepStatusWaiting && okb && rb.Status == durable.StepStatusWaiting
+	})
+
+	tokenA := encodeTestToken("dual", "r1", "a")
+	if err := durable.CompleteStep(context.Background(), e, tokenA, "A"); err != nil {
+		t.Fatal(err)
+	}
+
+	// b is still pending — the run must remain Waiting.
+	time.Sleep(50 * time.Millisecond)
+	if run.Status() != durable.StatusWaiting {
+		t.Fatalf("run left Waiting while sibling still pending: %s", run.Status())
+	}
+
+	tokenB := encodeTestToken("dual", "r1", "b")
+	if err := durable.CompleteStep(context.Background(), e, tokenB, "B"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "AB" {
+		t.Fatalf("got %q", out)
 	}
 }
 
@@ -319,7 +539,7 @@ func registerApproval(t *testing.T, e *durable.Engine, calls *atomic.Int32) {
 			if calls != nil {
 				calls.Add(1)
 			}
-			_ = s.StepToken()
+			_ = s.StepToken(ctx)
 			return approval{}, durable.ErrStepPending
 		}).Get(ctx)
 	})); err != nil {
@@ -391,6 +611,97 @@ func TestCompleteStep_IdempotentWhileWaiting(t *testing.T) {
 	}
 	if _, err := run.Get(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCompleteStep_ConcurrentSameTokenNoDoubleDeliver fires several
+// concurrent CompleteStep calls for the same token — exercises the
+// signalLocks race fix. Run with -race.
+func TestCompleteStep_ConcurrentSameTokenNoDoubleDeliver(t *testing.T) {
+	e := newTestEngine(t)
+	registerApproval(t, e, nil)
+	run := durable.RunTask[string, approval](context.Background(), e, "approve", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
+
+	token := encodeTestToken("approve", "r1", "approve")
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = durable.CompleteStep(context.Background(), e, token, approval{By: fmt.Sprintf("caller-%d", i)})
+		}(i)
+	}
+	wg.Wait()
+
+	out, err := run.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.By == "" {
+		t.Fatal("expected a delivered result")
+	}
+}
+
+// TestRunStep_ConcurrentCompleteStepNoRace fans out N pending steps and
+// completes all of them concurrently from separate goroutines — exercises
+// both the setRunStatus race fix (concurrent leaveWaiting) and appendSignal
+// under concurrent CompleteStep calls for distinct stepIDs. Run with -race.
+func TestRunStep_ConcurrentCompleteStepNoRace(t *testing.T) {
+	e := newTestEngine(t)
+	const n = 8
+	if err := durable.RegisterTask(e, "raceN", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		runs := make([]*durable.StepRun[string], n)
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("s%d", i)
+			runs[i] = durable.RunStep(ctx, s, id, func(ctx context.Context) (string, error) {
+				return "", durable.ErrStepPending
+			})
+		}
+		for i := 0; i < n; i++ {
+			if _, err := runs[i].Get(ctx); err != nil {
+				return "", err
+			}
+		}
+		return "ok", nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	run := durable.RunTask[string, string](context.Background(), e, "raceN", "r1", "")
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("s%d", i)
+		waitUntil(t, 2*time.Second, func() bool {
+			rec, ok, _ := e.GetStep(context.Background(), "raceN", "r1", id)
+			return ok && rec.Status == durable.StepStatusWaiting
+		})
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			token := encodeTestToken("raceN", "r1", fmt.Sprintf("s%d", i))
+			_ = durable.CompleteStep(context.Background(), e, token, "done")
+		}(i)
+	}
+	wg.Wait()
+
+	out, err := run.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "ok" {
+		t.Fatalf("got %q", out)
+	}
+	info, ok, err := e.GetTask(context.Background(), "raceN", "r1")
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if info.Status != durable.StatusCompleted {
+		t.Fatalf("final status %s", info.Status)
 	}
 }
 

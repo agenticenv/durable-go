@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,6 +66,48 @@ func TestNewEngine_ReopenAfterClose(t *testing.T) {
 	if err := e2.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestEngine_CloseDrainsInFlightSteps starts a task with two fanned-out
+// steps and closes the engine while one is still running. Close must not
+// return until that step's goroutine has observed ctx cancellation and
+// exited — otherwise compactJournal or a second Engine on the same dataDir
+// could race an in-flight append.
+func TestEngine_CloseDrainsInFlightSteps(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{})
+	var finished atomic.Bool
+	if err := durable.RegisterTask(e, "drain", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		x := durable.RunStep(ctx, s, "fast", func(ctx context.Context) (string, error) { return "ok", nil })
+		y := durable.RunStep(ctx, s, "slow", func(ctx context.Context) (string, error) {
+			close(started)
+			<-ctx.Done()
+			finished.Store(true)
+			return "", ctx.Err()
+		})
+		if _, err := x.Get(ctx); err != nil {
+			return "", err
+		}
+		_, err := y.Get(ctx)
+		return "", err
+	}), durable.WithTaskTimeout(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	run := durable.RunTask[string, string](context.Background(), e, "drain", "", "")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step did not start")
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !finished.Load() {
+		t.Fatal("Close returned before the in-flight step observed cancellation")
+	}
+	_, _ = run.Get(context.Background())
 }
 
 func TestEngine_CloseIdempotent(t *testing.T) {

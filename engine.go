@@ -102,25 +102,26 @@ func WithLockTimeout(d time.Duration) EngineOption {
 // Always call Close to cancel in-flight runs, release the exclusive flock,
 // stop the purger, and close journal file handles.
 type Engine struct {
-	dataDir   string
-	cfg       engineConfig
-	lockFile  *flock.Flock
-	registry  map[string]taskEntry
-	mu        sync.RWMutex
-	runLocks  sync.Map // "taskID/runID" → *sync.Mutex
-	openFiles sync.Map // "taskID/runID" → *journalFile
-	signals   sync.Map // "taskID/runID/stepID" → chan []byte
-	watchers  sync.Map // "taskID/runID" → *stepWatchSet
-	stopCh    chan struct{}
-	runs      sync.WaitGroup // in-flight RunTask executors and auto-purge
-	closeOnce sync.Once
+	dataDir     string
+	cfg         engineConfig
+	lockFile    *flock.Flock
+	registry    map[string]taskEntry
+	mu          sync.RWMutex
+	runLocks    sync.Map // "taskID/runID" → *sync.Mutex, held for a run's whole execution
+	signalLocks sync.Map // "taskID/runID/stepID" → *sync.Mutex, held only inside CompleteStep
+	openFiles   sync.Map // "taskID/runID" → *journalFile
+	signals     sync.Map // "taskID/runID/stepID" → chan []byte
+	watchers    sync.Map // "taskID/runID" → *stepWatchSet
+	stopCh      chan struct{}
+	runs        sync.WaitGroup // in-flight RunTask executors and auto-purge
+	closeOnce   sync.Once
 }
 
 // stepWatchSet is the in-process fan-out for WatchSteps. appendStep wakes
 // every subscriber after the journal write succeeds.
 type stepWatchSet struct {
 	mu  sync.Mutex
-	chs map[chan StepRecord]struct{}
+	chs map[chan StepEvent]struct{}
 }
 
 // NewEngine opens or creates dataDir, acquires an exclusive flock on
@@ -281,6 +282,18 @@ func (e *Engine) tryLockRun(taskID, runID string) (*sync.Mutex, bool) {
 		return mu, true
 	}
 	return nil, false
+}
+
+// lockSignal serialises CompleteStep calls for one (taskID,runID,stepID),
+// distinct from lockRun. lockRun is held for a run's entire execution,
+// including while a step is blocked waiting — CompleteStep must never wait
+// on it, or a CompleteStep call for the very run it is trying to resume
+// would deadlock against itself.
+func (e *Engine) lockSignal(taskID, runID, stepID string) *sync.Mutex {
+	actual, _ := e.signalLocks.LoadOrStore(taskID+"/"+runID+"/"+stepID, &sync.Mutex{})
+	mu := actual.(*sync.Mutex)
+	mu.Lock()
+	return mu
 }
 
 func (e *Engine) lookupTask(taskID string) (taskEntry, bool) {
