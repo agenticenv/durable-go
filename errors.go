@@ -40,4 +40,14 @@ var (
 	// ErrInvalidToken is returned by CompleteStep when the token cannot be
 	// decoded into taskID, runID, and stepID.
 	ErrInvalidToken = errors.New("durable: invalid step token")
+
+	// ErrRunCancelled is the error stored on a run (TaskInfo.Error, as its
+	// string form) and returned by RunStep/Get after CancelRun. It marks
+	// the run as StatusFailed for the same reason engine Close and task/run
+	// timeouts already do — but with a distinct message so callers can
+	// tell a deliberate CancelRun apart from a generic ctx cancellation or
+	// deadline. Because TaskInfo.Error is a plain string, matching after a
+	// resume requires comparing against ErrRunCancelled.Error(), not
+	// errors.Is.
+	ErrRunCancelled = errors.New("durable: run was cancelled")
 )

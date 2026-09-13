@@ -217,6 +217,15 @@ type runHandle struct {
 	output     []byte
 	err        error
 	finishOnce sync.Once
+
+	// cancel is the CancelFunc for this run's ctx (the one delivered to
+	// Task.Exec/RunStep). Set by RunTask; called by CancelRun when the run
+	// is executing in this process. cancelRequested distinguishes a
+	// deliberate CancelRun cancellation from engine Close or a task/run
+	// timeout so executeRun can report ErrRunCancelled instead of a plain
+	// ctx error.
+	cancel          context.CancelFunc
+	cancelRequested atomic.Bool
 }
 
 func newRunHandle(runID string, status TaskStatus) *runHandle {
@@ -380,6 +389,9 @@ func RunTask[I, O any](ctx context.Context, e *Engine, taskID string, runID stri
 	if timeout > 0 {
 		runCtx, cancel = context.WithTimeout(context.Background(), timeout)
 	}
+	h.cancel = cancel
+	runKey := taskID + "/" + resolved
+	e.runCancels.Store(runKey, h)
 	stopWatchDone := make(chan struct{})
 	go func() {
 		select {
@@ -393,9 +405,10 @@ func RunTask[I, O any](ctx context.Context, e *Engine, taskID string, runID stri
 		defer e.runs.Done()
 		defer close(stopWatchDone)
 		defer cancel()
+		defer e.runCancels.Delete(runKey)
 		mu := e.lockRun(taskID, resolved)
 		defer mu.Unlock()
-		e.executeRun(runCtx, taskID, resolved, entry, inputBytes, maxRetries, h)
+		e.executeRun(runCtx, cancel, taskID, resolved, entry, inputBytes, maxRetries, h)
 	}()
 	return &TaskRun[O]{h: h}
 }
@@ -427,7 +440,7 @@ func (e *Engine) resolveRunID(ctx context.Context, taskID, runID string) (string
 	return ulid.Make().String(), nil
 }
 
-func (e *Engine) executeRun(ctx context.Context, taskID, runID string, entry taskEntry, input []byte, maxRetries int, h *runHandle) {
+func (e *Engine) executeRun(ctx context.Context, cancel context.CancelFunc, taskID, runID string, entry taskEntry, input []byte, maxRetries int, h *runHandle) {
 	info, exists, err := e.loadMeta(taskID, runID)
 	if err != nil {
 		h.finish(nil, err)
@@ -480,6 +493,16 @@ func (e *Engine) executeRun(ctx context.Context, taskID, runID string, entry tas
 		h.finish(nil, err)
 		return
 	}
+
+	// A CancelRun call before this process last exited (or before this
+	// resume) persisted a cancel signal. Cancel ctx now, before Task.Exec
+	// is ever invoked, so every RunStep call fails fast with
+	// ErrRunCancelled instead of re-running fn.
+	if _, cancelled := signals[cancelSignalID]; cancelled {
+		h.cancelRequested.Store(true)
+		cancel()
+	}
+
 	cache := make(map[string]StepRecord, len(steps))
 	for id, rec := range steps {
 		switch rec.Status {
@@ -534,7 +557,11 @@ func (e *Engine) executeRun(ctx context.Context, taskID, runID string, entry tas
 			break
 		}
 		if ctx.Err() != nil {
-			taskErr = ctx.Err()
+			if h.cancelRequested.Load() {
+				taskErr = ErrRunCancelled
+			} else {
+				taskErr = ctx.Err()
+			}
 			break
 		}
 		var stepErr *stepFailedError

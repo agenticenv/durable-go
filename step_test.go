@@ -839,6 +839,27 @@ func TestStepIDAccessor(t *testing.T) {
 	}
 }
 
+// TestRunStep_ReservedCancelIDPanics locks in that the sentinel signal ID
+// CancelRun uses can never be a real stepID, so it can never collide with a
+// legitimate CompleteStep-addressed step.
+func TestRunStep_ReservedCancelIDPanics(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "reserved", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("expected panic for reserved step ID")
+			}
+		}()
+		return durable.RunStep(ctx, s, "\x00cancel", func(ctx context.Context) (string, error) {
+			return "", nil
+		}).Get(ctx)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](context.Background(), e, "reserved", "", "")
+	_, _ = run.Get(context.Background())
+}
+
 func TestCompleteStep_TokenWithColonInStepID(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "c", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {

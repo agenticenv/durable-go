@@ -108,14 +108,24 @@ type Engine struct {
 	registry    map[string]taskEntry
 	mu          sync.RWMutex
 	runLocks    sync.Map // "taskID/runID" → *sync.Mutex, held for a run's whole execution
-	signalLocks sync.Map // "taskID/runID/stepID" → *sync.Mutex, held only inside CompleteStep
+	signalLocks sync.Map // "taskID/runID/stepID" → *sync.Mutex, held only inside CompleteStep and CancelRun
 	openFiles   sync.Map // "taskID/runID" → *journalFile
 	signals     sync.Map // "taskID/runID/stepID" → chan []byte
 	watchers    sync.Map // "taskID/runID" → *stepWatchSet
+	runCancels  sync.Map // "taskID/runID" → *runHandle, present only while the run executes in this process
 	stopCh      chan struct{}
 	runs        sync.WaitGroup // in-flight RunTask executors and auto-purge
 	closeOnce   sync.Once
 }
+
+// cancelSignalID is a reserved SignalEntry ID used by CancelRun to persist a
+// durable cancel intent via the same journal plumbing as CompleteStep. It
+// starts with a NUL byte so it can never collide with a real, user-supplied
+// stepID (RunStep panics if a caller tries to use it). The payload content
+// is never read back — only the signal's presence in the journal matters.
+const cancelSignalID = "\x00cancel"
+
+var cancelSignalPayload = []byte("true")
 
 // stepWatchSet is the in-process fan-out for WatchSteps. appendStep wakes
 // every subscriber after the journal write succeeds.
@@ -198,6 +208,16 @@ func ensureWritable(dir string) error {
 // Close cancels in-flight runs, waits for them and the auto-purger to
 // finish writing, then releases the exclusive flock and journal handles.
 // Safe to call more than once.
+//
+// Cancelling ctx only signals — it does not forcibly stop a step function.
+// Close waits for every in-flight RunStep goroutine to actually return
+// (see StepRunner.waitInFlight) so a step's own journal append can never
+// race compactJournal or a second Engine opening the same dataDir. If a
+// step function never checks ctx and never returns, Close blocks forever
+// and the exclusive flock on dataDir is never released. Write step
+// functions so they select on ctx (or pass it to ctx-aware calls like
+// http.NewRequestWithContext) instead of running unconditionally to
+// completion.
 func (e *Engine) Close() error {
 	var err error
 	e.closeOnce.Do(func() {
@@ -294,6 +314,82 @@ func (e *Engine) lockSignal(taskID, runID, stepID string) *sync.Mutex {
 	mu := actual.(*sync.Mutex)
 	mu.Lock()
 	return mu
+}
+
+// CancelRun requests cancellation of a run. It persists a durable cancel
+// signal — reusing the SignalEntry/CompleteStep journal plumbing via a
+// reserved signal ID — so the intent survives a crash: on the next RunTask
+// for this taskID/runID, the run's ctx is cancelled before Task.Exec is
+// invoked, and every RunStep call fails fast with ErrRunCancelled instead
+// of re-running fn. If the run is currently executing in this process, its
+// ctx is also cancelled immediately.
+//
+// Cancelling ctx only signals a step function; it cannot forcibly stop
+// one. RunStep.Get and RunTask.Get both return promptly regardless — they
+// select on ctx.Done() independently of whether the step's goroutine has
+// exited. But the engine still waits for that goroutine to actually return
+// before the run reaches a terminal state or Close/compactJournal can
+// safely proceed (see Close). If the step function never checks ctx and
+// never returns, that goroutine runs to completion in the background and
+// the run stays non-terminal until it does — Close called afterward would
+// block on it too. Write step functions so they select on ctx instead of
+// running unconditionally to completion.
+//
+// The run ends up StatusFailed (the same terminal status used for engine
+// Close and task/run timeouts) with TaskInfo.Error set to
+// ErrRunCancelled.Error(), so callers can distinguish a deliberate cancel
+// from another failure by comparing that string.
+//
+// Returns ErrRunAlreadyFinished if the run is already StatusCompleted or
+// StatusFailed, or an error if taskID/runID is invalid or the run does not
+// exist. Idempotent: calling it more than once on the same run is a no-op
+// after the first call's signal is durably written.
+func (e *Engine) CancelRun(ctx context.Context, taskID, runID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateTaskID(taskID); err != nil {
+		return err
+	}
+	if err := validateRunID(runID); err != nil {
+		return err
+	}
+
+	// Serialised on the same per-(taskID,runID,stepID) lock CompleteStep
+	// uses (with stepID = the reserved cancelSignalID) so two concurrent
+	// CancelRun calls for the same run cannot both decide the signal is
+	// missing and double-append it.
+	mu := e.lockSignal(taskID, runID, cancelSignalID)
+	defer mu.Unlock()
+
+	info, ok, err := e.loadMeta(taskID, runID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("durable: run %s/%s not found", taskID, runID)
+	}
+	if info.Status == StatusCompleted || info.Status == StatusFailed {
+		return ErrRunAlreadyFinished
+	}
+
+	_, signals, err := e.loadJournal(taskID, runID)
+	if err != nil {
+		return err
+	}
+	if _, exists := signals[cancelSignalID]; !exists {
+		if err := e.appendSignal(taskID, runID, cancelSignalID, cancelSignalPayload); err != nil {
+			return err
+		}
+	}
+
+	if v, ok := e.runCancels.Load(taskID + "/" + runID); ok {
+		h := v.(*runHandle)
+		h.cancelRequested.Store(true)
+		h.cancel()
+	}
+	e.cfg.logger.Info("run cancel requested", "task_id", taskID, "run_id", runID)
+	return nil
 }
 
 func (e *Engine) lookupTask(taskID string) (taskEntry, bool) {

@@ -272,6 +272,233 @@ func TestWithAutoPurge(t *testing.T) {
 	t.Fatal("auto-purge did not remove completed run")
 }
 
+// TestCancelRun_LiveInFlightStepObservesCancellation starts a task with one
+// step blocked on <-ctx.Done(), calls CancelRun while it is running, and
+// checks the step's ctx fires immediately and the run ends up StatusFailed
+// with the ErrRunCancelled message.
+func TestCancelRun_LiveInFlightStepObservesCancellation(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{})
+	var observedCancel atomic.Bool
+
+	if err := durable.RegisterTask(e, "cancel-live", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "block", func(ctx context.Context) (string, error) {
+			close(started)
+			<-ctx.Done()
+			observedCancel.Store(true)
+			return "", ctx.Err()
+		}).Get(ctx)
+	}), durable.WithTaskTimeout(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	run := durable.RunTask[string, string](context.Background(), e, "cancel-live", "r1", "")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step did not start")
+	}
+
+	if err := e.CancelRun(context.Background(), "cancel-live", "r1"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := run.Get(context.Background())
+	if !errors.Is(err, durable.ErrRunCancelled) {
+		t.Fatalf("got %v, want ErrRunCancelled", err)
+	}
+	if !observedCancel.Load() {
+		t.Fatal("in-flight step never observed ctx cancellation")
+	}
+
+	info, ok, err := e.GetTask(context.Background(), "cancel-live", "r1")
+	if err != nil || !ok {
+		t.Fatalf("GetTask: ok=%v err=%v", ok, err)
+	}
+	if info.Status != durable.StatusFailed || info.Error != durable.ErrRunCancelled.Error() {
+		t.Fatalf("info=%+v", info)
+	}
+}
+
+// TestCancelRun_SubsequentRunStepFailsFast proves RunStep is checked before
+// running fn, not just at the step that was in flight when CancelRun fired:
+// once the first step observes cancellation and returns, a second RunStep
+// call must fail immediately without ever invoking its fn.
+func TestCancelRun_SubsequentRunStepFailsFast(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{})
+	var secondStepCalled atomic.Bool
+
+	if err := durable.RegisterTask(e, "cancel-chain", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		_, err := durable.RunStep(ctx, s, "block", func(ctx context.Context) (string, error) {
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		}).Get(ctx)
+		if err == nil {
+			t.Error("expected first step to fail")
+		}
+		_, err2 := durable.RunStep(ctx, s, "second", func(ctx context.Context) (string, error) {
+			secondStepCalled.Store(true)
+			return "should not run", nil
+		}).Get(ctx)
+		return "", err2
+	}), durable.WithTaskTimeout(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	run := durable.RunTask[string, string](context.Background(), e, "cancel-chain", "r1", "")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step did not start")
+	}
+
+	if err := e.CancelRun(context.Background(), "cancel-chain", "r1"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := run.Get(context.Background())
+	if !errors.Is(err, durable.ErrRunCancelled) {
+		t.Fatalf("got %v, want ErrRunCancelled", err)
+	}
+	if secondStepCalled.Load() {
+		t.Fatal("second RunStep's fn ran after cancellation")
+	}
+}
+
+// TestCancelRun_SurvivesCrashResume persists a cancel signal on a copy of
+// the data directory that has no live goroutine for the run (simulating a
+// process that crashed while the step was durably StatusWaiting), then
+// resumes on a fresh engine and checks the run fails fast with
+// ErrRunCancelled without ever re-invoking the step's fn.
+func TestCancelRun_SurvivesCrashResume(t *testing.T) {
+	src := t.TempDir()
+	ctx := context.Background()
+	var calls atomic.Int32
+
+	e1, err := durable.NewEngine(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.RegisterTask(e1, "cancel-resume", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "work", func(ctx context.Context) (string, error) {
+			calls.Add(1)
+			return "", durable.ErrStepPending
+		}).Get(ctx)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](ctx, e1, "cancel-resume", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
+	if calls.Load() != 1 {
+		t.Fatalf("fn calls %d", calls.Load())
+	}
+
+	dst := t.TempDir()
+	if err := copyDir(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	_ = e1.Close()
+
+	e2, err := durable.NewEngine(ctx, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e2.Close() }()
+	if err := durable.RegisterTask(e2, "cancel-resume", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "work", func(ctx context.Context) (string, error) {
+			calls.Add(1)
+			return "", durable.ErrStepPending
+		}).Get(ctx)
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nobody has called RunTask on e2 yet, so this only appends the durable
+	// signal — there is no in-process ctx to cancel live.
+	if err := e2.CancelRun(ctx, "cancel-resume", "r1"); err != nil {
+		t.Fatal(err)
+	}
+
+	r2 := durable.RunTask[string, string](ctx, e2, "cancel-resume", "r1", "")
+	_, err = r2.Get(ctx)
+	if !errors.Is(err, durable.ErrRunCancelled) {
+		t.Fatalf("got %v, want ErrRunCancelled", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("step fn re-ran on a cancelled resume: calls=%d", calls.Load())
+	}
+
+	info, ok, err := e2.GetTask(ctx, "cancel-resume", "r1")
+	if err != nil || !ok {
+		t.Fatalf("GetTask: ok=%v err=%v", ok, err)
+	}
+	if info.Status != durable.StatusFailed || info.Error != durable.ErrRunCancelled.Error() {
+		t.Fatalf("info=%+v", info)
+	}
+}
+
+func TestCancelRun_NotFound(t *testing.T) {
+	e := newTestEngine(t)
+	err := e.CancelRun(context.Background(), "nope", "r1")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestCancelRun_AlreadyFinished(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "done", identityTask()); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](context.Background(), e, "done", "r1", "hi")
+	if _, err := run.Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	err := e.CancelRun(context.Background(), "done", "r1")
+	if !errors.Is(err, durable.ErrRunAlreadyFinished) {
+		t.Fatalf("got %v, want ErrRunAlreadyFinished", err)
+	}
+}
+
+// TestCancelRun_Idempotent checks a second CancelRun call on an already
+// cancel-requested, still-running run is a harmless no-op rather than an
+// error or a duplicate signal that breaks resume.
+func TestCancelRun_Idempotent(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{})
+
+	if err := durable.RegisterTask(e, "cancel-twice", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "block", func(ctx context.Context) (string, error) {
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		}).Get(ctx)
+	}), durable.WithTaskTimeout(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	run := durable.RunTask[string, string](context.Background(), e, "cancel-twice", "r1", "")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("step did not start")
+	}
+
+	if err := e.CancelRun(context.Background(), "cancel-twice", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CancelRun(context.Background(), "cancel-twice", "r1"); err != nil {
+		t.Fatalf("second CancelRun: %v", err)
+	}
+
+	_, err := run.Get(context.Background())
+	if !errors.Is(err, durable.ErrRunCancelled) {
+		t.Fatalf("got %v, want ErrRunCancelled", err)
+	}
+}
+
 func TestReadOnly_WithROLogger(t *testing.T) {
 	dir := t.TempDir()
 	e, err := durable.NewEngine(context.Background(), dir)

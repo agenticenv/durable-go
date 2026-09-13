@@ -53,6 +53,10 @@ type StepOption func(*stepConfig)
 
 // WithStepTimeout is an inner bound: the step deadline is
 // min(task deadline, step timeout). It cannot extend past the task deadline.
+// The deadline only cancels the step's ctx — it does not forcibly stop fn.
+// A fn that never checks ctx keeps running past the deadline in the
+// background, and the engine (Close, a later CancelRun's drain, etc.)
+// still waits for it to actually return.
 func WithStepTimeout(d time.Duration) StepOption {
 	return func(c *stepConfig) { c.timeout = &d }
 }
@@ -160,6 +164,17 @@ func (s *StepRunner) waitInFlight() {
 	s.inFlight.Wait()
 }
 
+// cancelErr maps a non-nil ctx error to ErrRunCancelled when it was this
+// run's own CancelRun call that cancelled ctx, so callers see a distinct,
+// matchable error instead of the generic context.Canceled shared with
+// engine Close and task/run timeouts.
+func (s *StepRunner) cancelErr(err error) error {
+	if err != nil && s.handle != nil && s.handle.cancelRequested.Load() {
+		return ErrRunCancelled
+	}
+	return err
+}
+
 func (s *StepRunner) storeCache(rec StepRecord) {
 	s.mu.Lock()
 	s.cache[rec.StepID] = rec
@@ -237,6 +252,20 @@ func RunStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(c
 	if stepID == "" {
 		panic("durable: step ID must not be empty")
 	}
+	if stepID == cancelSignalID {
+		panic(fmt.Sprintf("durable: step ID %q is reserved", stepID))
+	}
+
+	stopCh := s.engine.stopCh
+	var zero O
+
+	// Checked before every RunStep call — including replay of an already
+	// cached step, not just fresh work. Once ctx is cancelled (CancelRun,
+	// engine Close, or a task/run timeout), no further step work starts;
+	// callers do not need to check ctx themselves between RunStep calls.
+	if err := ctx.Err(); err != nil {
+		return readyStepRun(stepID, stopCh, zero, s.cancelErr(err))
+	}
 
 	s.mu.Lock()
 	if _, dup := s.seenSteps[stepID]; dup {
@@ -246,9 +275,6 @@ func RunStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(c
 	s.seenSteps[stepID] = struct{}{}
 	rec, has := s.cache[stepID]
 	s.mu.Unlock()
-
-	stopCh := s.engine.stopCh
-	var zero O
 
 	if has && rec.Status == StepStatusCompleted {
 		var out O
@@ -301,6 +327,14 @@ func execStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(
 	maxRetries := 0
 	if cfg.maxRetries != nil && *cfg.maxRetries > 0 {
 		maxRetries = *cfg.maxRetries
+	}
+
+	// Narrow race between RunStep's own upfront check and this goroutine
+	// being scheduled (e.g. a concurrent CancelRun in between): fn is not
+	// invoked and no STARTED event is written, matching an unfinished
+	// STARTED step's "missing on replay" treatment.
+	if err := ctx.Err(); err != nil {
+		return zero, s.cancelErr(err)
 	}
 
 	startedAt := time.Now().UTC()
