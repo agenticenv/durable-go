@@ -300,3 +300,39 @@ func TestSaveLoadOutput(t *testing.T) {
 		t.Fatalf("got %s", got)
 	}
 }
+
+func TestSaveLoadInput(t *testing.T) {
+	dir := t.TempDir()
+	if err := saveInput(dir, "t", "r", []byte(`{"goal":"x"}`)); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := loadInput(dir, "t", "r")
+	if err != nil || !ok {
+		t.Fatalf("load: ok=%v err=%v", ok, err)
+	}
+	if string(got) != `{"goal":"x"}` {
+		t.Fatalf("got %s", got)
+	}
+	_, ok, err = loadInput(dir, "t", "missing")
+	if err != nil || ok {
+		t.Fatalf("missing: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestResolveRunInput_StoredWins(t *testing.T) {
+	dir := t.TempDir()
+	first, err := resolveRunInput(dir, "t", "r", []byte(`"keep"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != `"keep"` {
+		t.Fatalf("first %s", first)
+	}
+	second, err := resolveRunInput(dir, "t", "r", []byte(`"ignore"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second) != `"keep"` {
+		t.Fatalf("stored-wins %s", second)
+	}
+}

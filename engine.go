@@ -110,9 +110,17 @@ type Engine struct {
 	runLocks  sync.Map // "taskID/runID" → *sync.Mutex
 	openFiles sync.Map // "taskID/runID" → *journalFile
 	signals   sync.Map // "taskID/runID/stepID" → chan []byte
+	watchers  sync.Map // "taskID/runID" → *stepWatchSet
 	stopCh    chan struct{}
 	runs      sync.WaitGroup // in-flight RunTask executors and auto-purge
 	closeOnce sync.Once
+}
+
+// stepWatchSet is the in-process fan-out for WatchSteps. appendStep wakes
+// every subscriber after the journal write succeeds.
+type stepWatchSet struct {
+	mu  sync.Mutex
+	chs map[chan StepRecord]struct{}
 }
 
 // NewEngine opens or creates dataDir, acquires an exclusive flock on

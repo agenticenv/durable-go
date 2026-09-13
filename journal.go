@@ -56,6 +56,10 @@ func (e *Engine) loadOutput(taskID, runID string) ([]byte, error) {
 	return loadOutput(e.dataDir, taskID, runID)
 }
 
+func (e *Engine) resolveRunInput(taskID, runID string, caller []byte) ([]byte, error) {
+	return resolveRunInput(e.dataDir, taskID, runID, caller)
+}
+
 func (e *Engine) loadJournal(taskID, runID string) (map[string]StepRecord, map[string][]byte, error) {
 	return loadJournal(e.dataDir, taskID, runID)
 }
@@ -105,9 +109,44 @@ func loadOutput(dataDir, taskID, runID string) ([]byte, error) {
 	return raw, nil
 }
 
+func saveInput(dataDir, taskID, runID string, input []byte) error {
+	if err := writeFileAtomic(inputPath(dataDir, taskID, runID), input); err != nil {
+		return fmt.Errorf("durable: write input %s/%s: %w", taskID, runID, err)
+	}
+	return nil
+}
+
+func loadInput(dataDir, taskID, runID string) ([]byte, bool, error) {
+	raw, err := os.ReadFile(inputPath(dataDir, taskID, runID))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("durable: read input %s/%s: %w", taskID, runID, err)
+	}
+	return raw, true, nil
+}
+
+// resolveRunInput returns the stored input when input.json exists (resume).
+// Otherwise it persists caller bytes and returns them (first start, or a
+// pre-v1 run that has no input file).
+func resolveRunInput(dataDir, taskID, runID string, caller []byte) ([]byte, error) {
+	stored, ok, err := loadInput(dataDir, taskID, runID)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return stored, nil
+	}
+	if err := saveInput(dataDir, taskID, runID, caller); err != nil {
+		return nil, err
+	}
+	return caller, nil
+}
+
 // writeFileAtomic persists data via tmp+sync+rename so a crash mid-write
 // leaves either the previous file or the new one — never a half-written
-// meta.json or output.json.
+// meta.json, input.json, or output.json.
 func writeFileAtomic(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -145,6 +184,7 @@ func (e *Engine) appendStep(taskID, runID string, step StepRecord) error {
 	if err := e.appendFrame(taskID, runID, entry); err != nil {
 		return fmt.Errorf("durable: append step %s/%s/%s: %w", taskID, runID, step.StepID, err)
 	}
+	e.notifyStepWatchers(taskID, runID, step)
 	return nil
 }
 

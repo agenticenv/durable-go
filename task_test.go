@@ -289,6 +289,57 @@ func TestRunTask_ResumeReplaysSteps(t *testing.T) {
 	}
 }
 
+func TestRunTask_ResumeUsesStoredInput(t *testing.T) {
+	src := t.TempDir()
+	ctx := context.Background()
+	e1, err := durable.NewEngine(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.RegisterTask(e1, "echo-in", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+			return "", durable.ErrStepPending
+		}).Get(ctx)
+		return in, err
+	})); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](ctx, e1, "echo-in", "r1", "keep-me")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
+
+	dst := t.TempDir()
+	if err := copyDir(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	_ = e1.Close()
+
+	e2, err := durable.NewEngine(ctx, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e2.Close() }()
+	if err := durable.RegisterTask(e2, "echo-in", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+			return "", durable.ErrStepPending
+		}).Get(ctx)
+		return in, err
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	token := encodeTestToken("echo-in", "r1", "wait")
+	if err := durable.CompleteStep(ctx, e2, token, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := durable.RunTask[string, string](ctx, e2, "echo-in", "r1", "ignore-me").Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "keep-me" {
+		t.Fatalf("stored input not used: got %q", out)
+	}
+}
+
 func TestRunTask_EmptyRunIDResumesOldestActive(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "single", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
@@ -639,5 +690,153 @@ func TestGetTask_InvalidIDs(t *testing.T) {
 	}
 	if _, _, err := e.GetTask(context.Background(), "t", "a/b"); !errors.Is(err, durable.ErrInvalidRunID) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func recvWatchSteps(t *testing.T, ch <-chan durable.StepRecord, n int, timeout time.Duration) []durable.StepRecord {
+	t.Helper()
+	out := make([]durable.StepRecord, 0, n)
+	deadline := time.After(timeout)
+	for len(out) < n {
+		select {
+		case rec, ok := <-ch:
+			if !ok {
+				t.Fatalf("watch closed after %d records, want %d", len(out), n)
+			}
+			out = append(out, rec)
+		case <-deadline:
+			t.Fatalf("timeout waiting for %d watch records, got %d", n, len(out))
+		}
+	}
+	return out
+}
+
+func TestWatchSteps_Live(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
+			return "", err
+		}
+		if _, err := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "2", nil }).Get(ctx); err != nil {
+			return "", err
+		}
+		return "ok", nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	ch, err := e.WatchSteps(context.Background(), "seq", "r", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := durable.RunTask[string, string](context.Background(), e, "seq", "r", "").Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := recvWatchSteps(t, ch, 2, 2*time.Second)
+	if got[0].StepID != "a" || got[0].Seq != 1 || got[1].StepID != "b" || got[1].Seq != 2 {
+		t.Fatalf("%+v", got)
+	}
+}
+
+func TestWatchSteps_FromSeq(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
+			return "", err
+		}
+		if _, err := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "2", nil }).Get(ctx); err != nil {
+			return "", err
+		}
+		return "ok", nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := durable.RunTask[string, string](context.Background(), e, "seq", "r", "").Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ch, err := e.WatchSteps(context.Background(), "seq", "r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := recvWatchSteps(t, ch, 1, 2*time.Second)
+	if got[0].StepID != "b" || got[0].Seq != 2 {
+		t.Fatalf("%+v", got)
+	}
+}
+
+func TestWatchSteps_CancelClosesChannel(t *testing.T) {
+	e := newTestEngine(t)
+	registerApproval(t, e, nil)
+	run := durable.RunTask[string, approval](context.Background(), e, "approve", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := e.WatchSteps(ctx, "approve", "r1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = recvWatchSteps(t, ch, 1, 2*time.Second)
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected watch channel to close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch did not close after cancel")
+	}
+	if run.Status() != durable.StatusWaiting {
+		t.Fatalf("run stopped: %s", run.Status())
+	}
+}
+
+func TestWatchSteps_WaitingThenCompleted(t *testing.T) {
+	e := newTestEngine(t)
+	registerApproval(t, e, nil)
+	ch, err := e.WatchSteps(context.Background(), "approve", "r1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, approval](context.Background(), e, "approve", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
+
+	first := recvWatchSteps(t, ch, 1, 2*time.Second)
+	if first[0].StepID != "approve" || first[0].Status != durable.StepStatusWaiting {
+		t.Fatalf("waiting %+v", first[0])
+	}
+
+	token := encodeTestToken("approve", "r1", "approve")
+	if err := durable.CompleteStep(context.Background(), e, token, approval{By: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	second := recvWatchSteps(t, ch, 1, 2*time.Second)
+	if second[0].StepID != "approve" || second[0].Status != durable.StepStatusCompleted {
+		t.Fatalf("completed %+v", second[0])
+	}
+	if _, err := run.Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWatchSteps_EngineCloseClosesChannel(t *testing.T) {
+	e, err := durable.NewEngine(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := e.WatchSteps(context.Background(), "t", "r", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected watch channel to close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch did not close after Engine.Close")
 	}
 }

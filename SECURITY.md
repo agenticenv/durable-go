@@ -20,7 +20,7 @@ We appreciate responsible disclosure and will acknowledge security researchers w
 ## Scope
 
 - Security issues in the durable-go engine (`NewEngine`, `RunTask`, `RunStep`, `CompleteStep`, task lifecycle)
-- The filesystem journal under `dataDir` (`meta.json`, `journal.log`, `output.json`, OS flock)
+- The filesystem journal under `dataDir` (`meta.json`, `input.json`, `journal.log`, `output.json`, OS flock)
 - Sensitive data exposure in persisted task or step records
 
 ## Security Considerations
@@ -31,7 +31,7 @@ Step results are JSON-marshalled and stored. Do not put secrets, API keys, or cr
 
 ### Journal files
 
-The engine writes `meta.json`, `journal.log`, and `output.json` under `dataDir/tasks/`. Restrict filesystem permissions on that directory. Do not commit `examples/**/.data/` directories.
+The engine writes `meta.json`, `input.json`, `journal.log`, and `output.json` under `dataDir/tasks/`. Restrict filesystem permissions on that directory. Do not commit `examples/**/.data/` directories.
 
 ### Third-party dependencies
 

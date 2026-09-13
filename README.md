@@ -117,12 +117,14 @@ Register tasks after every `NewEngine`, then resume active runs. Pass the saved 
 durable.RegisterTask(e, "process-order", ...)
 pending, _ := e.ListTasks(ctx, durable.StatusRunning, durable.StatusWaiting)
 for _, t := range pending {
-    run := durable.RunTask[OrderInput, OrderOutput](ctx, e, t.TaskID, t.RunID, reloadInput(t))
+    run := durable.RunTask[OrderInput, OrderOutput](ctx, e, t.TaskID, t.RunID, OrderInput{})
     go func() { _, _ = run.Get(ctx) }()
 }
 ```
 
-Task inputs are not persisted. Pass the same input when resuming.
+`RunTask` writes `input.json` on first start. The same runID reloads it; the input argument is ignored.
+
+`WatchSteps` streams step events for a run (from a seq, then live as each step is written). Cancelling the watch does not stop the run.
 
 Full example: [`examples/resume/`](examples/resume/).
 
@@ -139,7 +141,7 @@ Also:
 - **Unique step IDs** — one stable string per step (literals or `fmt.Sprintf("step-%d", i)`). Reusing an ID panics.
 - **Sequential `RunStep` calls** — concurrent calls on the same `StepRunner` panic. Fan out work, then persist results sequentially.
 - **JSON results** — step and task outputs must be JSON-marshalable.
-- **Same runID to resume** — inputs are not persisted; pass the same input to `RunTask` when resuming.
+- **Same runID to resume** — `input.json` is reloaded; you do not need to pass the original input again.
 
 ## Examples
 

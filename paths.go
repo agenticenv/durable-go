@@ -11,6 +11,7 @@ const (
 	metaFileName    = "meta.json"
 	journalFileName = "journal.log"
 	outputFileName  = "output.json"
+	inputFileName   = "input.json"
 	lockFileName    = ".lock"
 )
 
@@ -32,6 +33,10 @@ func journalPath(dataDir, taskID, runID string) string {
 
 func outputPath(dataDir, taskID, runID string) string {
 	return filepath.Join(runDir(dataDir, taskID, runID), outputFileName)
+}
+
+func inputPath(dataDir, taskID, runID string) string {
+	return filepath.Join(runDir(dataDir, taskID, runID), inputFileName)
 }
 
 func lockPath(dataDir string) string {

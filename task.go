@@ -31,8 +31,8 @@ const (
 	StatusFailed TaskStatus = "failed"
 )
 
-// TaskInfo is the persistent metadata for a single run. Input is intentionally
-// omitted — callers own input persistence and reload it on recovery.
+// TaskInfo is the persistent metadata for a single run. The task input is
+// stored separately in input.json (see RunTask), not on this struct.
 type TaskInfo struct {
 	TaskID      string            `json:"task_id"`
 	RunID       string            `json:"run_id"`
@@ -318,10 +318,11 @@ func finishedTaskRun[O any](runID string, status TaskStatus, output []byte, err 
 }
 
 // RunTask starts or resumes a run in a background goroutine and returns
-// immediately. Pass an empty runID to resume the oldest active run for
-// taskID, or to generate a new ULID if none is active. Pass an existing
-// runID to resume; a completed or failed run returns the stored result
-// without spawning a goroutine.
+// immediately. On first start the input is written to input.json. The same
+// runID reloads that file and ignores the input argument. Pass an empty
+// runID to resume the oldest active run for taskID, or to generate a new
+// ULID if none is active. A completed or failed run returns the stored
+// result without spawning a goroutine.
 func RunTask[I, O any](ctx context.Context, e *Engine, taskID string, runID string, input I, opts ...RunOption) *TaskRun[O] {
 	if err := ctx.Err(); err != nil {
 		return failedTaskRun[O](err)
@@ -439,6 +440,12 @@ func (e *Engine) executeRun(ctx context.Context, taskID, runID string, entry tas
 	}
 	if exists && info.Status == StatusFailed {
 		h.finish(nil, errors.New(info.Error))
+		return
+	}
+
+	input, err = e.resolveRunInput(taskID, runID, input)
+	if err != nil {
+		h.finish(nil, err)
 		return
 	}
 
@@ -611,6 +618,146 @@ func (e *Engine) LoadSteps(ctx context.Context, taskID, runID string) ([]StepRec
 		return nil, err
 	}
 	return loadStepRecords(e.dataDir, taskID, runID)
+}
+
+const watchStepsBuf = 64
+
+// WatchSteps streams step events for a run. fromSeq is the offset (0 = from
+// the start). Already-written steps after that seq are sent first, then each
+// new step as it is persisted. The channel closes when ctx is cancelled or
+// the engine closes. Cancelling ctx does not stop the run.
+func (e *Engine) WatchSteps(ctx context.Context, taskID, runID string, fromSeq int) (<-chan StepRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateTaskID(taskID); err != nil {
+		return nil, err
+	}
+	if err := validateRunID(runID); err != nil {
+		return nil, err
+	}
+
+	notify := make(chan StepRecord, watchStepsBuf)
+	e.addStepWatcher(taskID, runID, notify)
+	recs, err := loadStepRecords(e.dataDir, taskID, runID)
+	if err != nil {
+		e.removeStepWatcher(taskID, runID, notify)
+		return nil, err
+	}
+	out := make(chan StepRecord, watchStepsBuf)
+	go e.runStepWatch(ctx, taskID, runID, fromSeq, recs, notify, out)
+	return out, nil
+}
+
+// watchCursor drops exact duplicates (same seq+step+status) but keeps a
+// later status on the same seq — waiting then completed share Seq.
+type watchCursor struct {
+	seq    int
+	stepID string
+	status StepStatus
+}
+
+func (c *watchCursor) take(rec StepRecord) bool {
+	if rec.Seq < c.seq {
+		return false
+	}
+	if rec.Seq == c.seq && rec.StepID == c.stepID && rec.Status == c.status {
+		return false
+	}
+	c.seq = rec.Seq
+	c.stepID = rec.StepID
+	c.status = rec.Status
+	return true
+}
+
+func (e *Engine) runStepWatch(ctx context.Context, taskID, runID string, fromSeq int, recs []StepRecord, notify, out chan StepRecord) {
+	defer close(out)
+	defer e.removeStepWatcher(taskID, runID, notify)
+
+	cur := watchCursor{seq: fromSeq}
+	for _, rec := range recs {
+		if rec.Seq <= fromSeq {
+			continue
+		}
+		if !cur.take(rec) {
+			continue
+		}
+		if !sendStepWatch(ctx, e.stopCh, out, rec) {
+			return
+		}
+	}
+
+	for {
+		select {
+		case rec := <-notify:
+			if !cur.take(rec) {
+				continue
+			}
+			if !sendStepWatch(ctx, e.stopCh, out, rec) {
+				return
+			}
+		case <-ctx.Done():
+			return
+		case <-e.stopCh:
+			return
+		}
+	}
+}
+
+func sendStepWatch(ctx context.Context, stopCh <-chan struct{}, out chan StepRecord, rec StepRecord) bool {
+	select {
+	case out <- rec:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-stopCh:
+		return false
+	}
+}
+
+func (e *Engine) addStepWatcher(taskID, runID string, ch chan StepRecord) {
+	key := taskID + "/" + runID
+	actual, _ := e.watchers.LoadOrStore(key, &stepWatchSet{chs: make(map[chan StepRecord]struct{})})
+	s := actual.(*stepWatchSet)
+	s.mu.Lock()
+	s.chs[ch] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (e *Engine) removeStepWatcher(taskID, runID string, ch chan StepRecord) {
+	key := taskID + "/" + runID
+	v, ok := e.watchers.Load(key)
+	if !ok {
+		return
+	}
+	s := v.(*stepWatchSet)
+	s.mu.Lock()
+	delete(s.chs, ch)
+	empty := len(s.chs) == 0
+	s.mu.Unlock()
+	if empty {
+		e.watchers.Delete(key)
+	}
+}
+
+func (e *Engine) notifyStepWatchers(taskID, runID string, rec StepRecord) {
+	v, ok := e.watchers.Load(taskID + "/" + runID)
+	if !ok {
+		return
+	}
+	s := v.(*stepWatchSet)
+	s.mu.Lock()
+	chs := make([]chan StepRecord, 0, len(s.chs))
+	for ch := range s.chs {
+		chs = append(chs, ch)
+	}
+	s.mu.Unlock()
+	for _, ch := range chs {
+		select {
+		case ch <- rec:
+		default:
+		}
+	}
 }
 
 // DeleteTaskRun removes one run directory and its journal. No-op if not found.
