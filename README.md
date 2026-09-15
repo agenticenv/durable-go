@@ -33,7 +33,7 @@
 
 Most durable-execution frameworks require external infrastructure—such as a dedicated workflow server or a Postgres database—and enforce strict code execution models like replay determinism.
 
-`durable-go` takes a zero-infra, in-process approach: a single Go library with a filesystem journal running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox. See [Use cases](#use-cases) for more places where durable-go is a perfect fit.
+`durable-go` takes a zero-infra, in-process approach: a single Go library with a filesystem journal running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox. The journal is files, not SQLite: no schema migrations when the library changes, and no connection/busy-lock handling for a single-process writer. See [Use cases](#use-cases) for more places where durable-go is a perfect fit.
 
 > **One writer per dataDir.** `NewEngine` takes an exclusive OS flock on `<dataDir>/.lock`. Do not open the same directory from two writer processes. Another process can open the same directory with `NewReadOnlyEngine` (shared lock).
 
@@ -213,6 +213,7 @@ Runnable examples in [examples/](examples/) — see [examples/README.md](example
 | [`examples/func-task/`](examples/func-task/) | Closure-style `durable.Func` |
 | [`examples/struct-task/`](examples/struct-task/) | Struct task with injected deps, retries, timeout |
 | [`examples/fanout/`](examples/fanout/) | Concurrent `RunStep`, `Get`-all join, `ErrStepPending` |
+| [`examples/yaml-task/`](examples/yaml-task/) | YAML file as one task; each YAML step is a `RunStep` |
 
 ```bash
 # from repo root
@@ -220,6 +221,7 @@ go run ./examples/resume/
 go run ./examples/func-task/
 go run ./examples/struct-task/
 go run ./examples/fanout/
+go run ./examples/yaml-task/
 ```
 
 ## Use cases

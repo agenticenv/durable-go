@@ -1,0 +1,11 @@
+# One YAML file = one durable-go task. Each steps[].id is a RunStep.
+# Edit this file and re-run to start a new workflow; an in-flight run
+# resumes from input.json (the spec from first start), not a later edit.
+name: provision-box
+steps:
+  - id: clone
+    run: echo clone
+  - id: build
+    run: echo build
+  - id: test
+    run: echo test
