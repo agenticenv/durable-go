@@ -131,6 +131,12 @@ go run ./examples/<name>/
 
 See [examples/README.md](examples/README.md) for the full list. Journal store data is written under `examples/<name>/.data/` (gitignored).
 
+Inspect a journal after the writer has closed (or on a copy):
+
+```bash
+go run ./cmd/durable-inspect -d examples/<name>/.data/<journal> task list
+```
+
 ## Ways to Contribute
 
 ### Propose a feature

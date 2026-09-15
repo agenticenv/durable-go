@@ -642,6 +642,21 @@ func (e *Engine) GetTask(ctx context.Context, taskID, runID string) (TaskInfo, b
 	return loadMeta(e.dataDir, taskID, runID)
 }
 
+// LoadInput returns the JSON-encoded task input written on first RunTask.
+// (nil, false, nil) if input.json is missing.
+func (e *Engine) LoadInput(ctx context.Context, taskID, runID string) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if err := validateTaskID(taskID); err != nil {
+		return nil, false, err
+	}
+	if err := validateRunID(runID); err != nil {
+		return nil, false, err
+	}
+	return loadInput(e.dataDir, taskID, runID)
+}
+
 // LoadSteps returns all StepRecords for a run. Used to inspect progress.
 // Includes waiting, completed, and failed steps. Order is not sorted or
 // otherwise guaranteed — it reflects map iteration order internally. Use
@@ -1018,6 +1033,21 @@ func (r *ReadOnlyEngine) GetTask(ctx context.Context, taskID, runID string) (Tas
 		return TaskInfo{}, false, err
 	}
 	return loadMeta(r.dataDir, taskID, runID)
+}
+
+// LoadInput returns the JSON-encoded task input written on first RunTask.
+// Same semantics as Engine.LoadInput.
+func (r *ReadOnlyEngine) LoadInput(ctx context.Context, taskID, runID string) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if err := validateTaskID(taskID); err != nil {
+		return nil, false, err
+	}
+	if err := validateRunID(runID); err != nil {
+		return nil, false, err
+	}
+	return loadInput(r.dataDir, taskID, runID)
 }
 
 // LoadSteps returns all StepRecords for a run ordered by Seq.

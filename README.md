@@ -224,6 +224,17 @@ go run ./examples/fanout/
 go run ./examples/yaml-task/
 ```
 
+## Inspect CLI
+
+`durable-inspect` is a read-only viewer for a journal (`task list` / `task get` / `step list` / `step get`). `--dir` / `-d` wins over `DURABLE_DIR`.
+
+```bash
+go install github.com/agenticenv/durable-go/cmd/durable-inspect@latest
+durable-inspect -d ./data task list
+```
+
+Commands, flags, lookup by name or ID, and the writer-lock behavior: see **[`cmd/durable-inspect/README.md`](cmd/durable-inspect/README.md)**.
+
 ## Use cases
 
 Match this table to your app. If your work is one process plus a local journal, durable-go is a fit.

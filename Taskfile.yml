@@ -25,11 +25,13 @@ tasks:
   # ── Build ─────────────────────────────────────────────────────────────────
 
   build:
-    desc: Compile all packages (library + examples)
+    desc: Compile all packages (library + examples) and durable-inspect
     cmds:
       - echo "==> Building durable-go..."
       - go build ./...
-      - echo "==> Build complete"
+      - mkdir -p bin
+      - go build -o bin/durable-inspect ./cmd/durable-inspect
+      - echo "==> Build complete (bin/durable-inspect)"
 
   # ── Test ──────────────────────────────────────────────────────────────────
 

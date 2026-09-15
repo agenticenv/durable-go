@@ -30,6 +30,9 @@ go.work.sum
 # Example runtime data (journal store directories created by go run ./examples/...)
 examples/**/.data/
 
+# Inspect CLI binary
+/bin/
+
 # Editor/IDE
 # .idea/
 # .vscode/

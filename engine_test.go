@@ -177,6 +177,10 @@ func TestReadOnlyEngine_SharedCoexistence(t *testing.T) {
 	if err != nil || len(steps) != 1 {
 		t.Fatalf("steps=%v err=%v", steps, err)
 	}
+	in, ok, err := r1.LoadInput(context.Background(), "echo", "r1")
+	if err != nil || !ok || string(in) != `"hi"` {
+		t.Fatalf("input ok=%v %s err=%v", ok, in, err)
+	}
 }
 
 func TestReadOnlyEngine_BlockedWhileWriterHoldsLock(t *testing.T) {
