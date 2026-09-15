@@ -33,7 +33,7 @@
 
 Most durable-execution frameworks require external infrastructure—such as a dedicated workflow server or a Postgres database—and enforce strict code execution models like replay determinism.
 
-`durable-go` takes a zero-infra, in-process approach: a single Go library with a filesystem journal running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox.
+`durable-go` takes a zero-infra, in-process approach: a single Go library with a filesystem journal running inside your application process. Instead of replaying entire function call graphs from an external orchestrator, `durable-go` memoizes individual step results. On resume the task runs again from the top; completed steps return the cached result. There is no replay-determinism sandbox. See [Use cases](#use-cases) for more places where durable-go is a perfect fit.
 
 > **One writer per dataDir.** `NewEngine` takes an exclusive OS flock on `<dataDir>/.lock`. Do not open the same directory from two writer processes. Another process can open the same directory with `NewReadOnlyEngine` (shared lock).
 
@@ -166,7 +166,7 @@ _, err := run.Get(ctx) // errors.Is(err, durable.ErrRunCancelled)
 - **Cooperative, like any Go `ctx`.** `RunStep.Get`/`RunTask.Get` return promptly regardless of whether the step's goroutine has exited, but the engine's drain (`Close`, and any run reaching a terminal state) waits for it to actually return — see rule 4 in [Writing tasks](#writing-tasks).
 - The run ends up `StatusFailed` (the same terminal status used for `Close` and timeouts) with `TaskInfo.Error` equal to `durable.ErrRunCancelled.Error()`, so callers can tell a deliberate cancel apart from another failure.
 
-## Resume
+### Resume
 
 Register tasks after every `NewEngine`, then resume active runs. Pass the saved runID (or `""` to resume the oldest Running/Waiting run for that taskID). Completed steps replay from the journal.
 
@@ -221,6 +221,19 @@ go run ./examples/func-task/
 go run ./examples/struct-task/
 go run ./examples/fanout/
 ```
+
+## Use cases
+
+Match this table to your app. If your work is one process plus a local journal, durable-go is a fit.
+
+| Use case | Why this library |
+|---|---|
+| **Single-process agent** (in-process loop, agent CLI) | Memoize each LLM / tool step so a crash resumes the same run; gate tools with `ErrStepPending`; inspect progress with `WatchSteps` / `NewReadOnlyEngine`. This is how [agent-sdk-go](https://github.com/agenticenv/agent-sdk-go) uses it by default. |
+| **Ops CLI** (migrate, import, backup, deploy) | Re-run the same command after a crash — completed steps skip; a second process can inspect the journal read-only while the job runs. |
+| **Daemon / sidecar** on one box | On boot, `ListTasks` + `RunTask(runID)` resumes in-flight work; webhooks call `CompleteStep`; `CancelRun` stops a live run and survives a crash. |
+| **Cron / batch / ETL** on one machine | Skip already-fetched extracts; fan-out parallel source/transform steps and join with `Get`, or take the first success with `select` on `Done()`. |
+| **Provisioning / install scripts** | Sequence create/configure/verify as steps so a failed run does not recreate what already succeeded. |
+| **Single-process service** (orders, payments, reports) | Charge, ship, notify as memoized steps; wait on manager approval or a webhook without blocking sibling work; race multiple providers with first-of-N. |
 
 ## Development
 
