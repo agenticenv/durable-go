@@ -37,7 +37,7 @@ var generateReport = durable.Func(func(
 	in ReportInput,
 ) (ReportOutput, error) {
 
-	_, err := durable.RunStep(ctx, s, "fetch-data", func(ctx context.Context) (struct{}, error) {
+	_, err := durable.RunStep(ctx, s, "fetch-data", in, func(ctx context.Context, in ReportInput) (struct{}, error) {
 		log.Printf("  → [fetch-data]   querying database for report %s …", in.ReportID)
 		time.Sleep(200 * time.Millisecond)
 		log.Printf("  ✓ [fetch-data]   done")
@@ -47,7 +47,7 @@ var generateReport = durable.Func(func(
 		return ReportOutput{}, err
 	}
 
-	_, err = durable.RunStep(ctx, s, "run-computation", func(ctx context.Context) (struct{}, error) {
+	_, err = durable.RunStep(ctx, s, "run-computation", struct{}{}, func(ctx context.Context, _ struct{}) (struct{}, error) {
 		log.Printf("  → [run-computation]  running expensive model inference …")
 		time.Sleep(300 * time.Millisecond)
 		log.Printf("  ✓ [run-computation]  done")
@@ -66,7 +66,7 @@ var generateReport = durable.Func(func(
 		return ReportOutput{}, err
 	}
 
-	out, err := durable.RunStep(ctx, s, "deliver-report", func(ctx context.Context) (ReportOutput, error) {
+	out, err := durable.RunStep(ctx, s, "deliver-report", struct{}{}, func(ctx context.Context, _ struct{}) (ReportOutput, error) {
 		log.Printf("  → [deliver-report]  sending report %s …", in.ReportID)
 		time.Sleep(100 * time.Millisecond)
 		log.Printf("  ✓ [deliver-report]  sent")

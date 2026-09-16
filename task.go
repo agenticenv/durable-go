@@ -50,7 +50,9 @@ type TaskInfo struct {
 // Task is the execution contract for a durable task.
 // Implementations should treat any work with external side effects as a
 // RunStep; non-deterministic logic outside of RunStep calls may not be
-// replayed correctly. I is the input type; O is the output type.
+// replayed correctly. I is the single input type (not variadic args); O is
+// the output type. Bundle several fields in one struct. A task with no
+// payload uses I = struct{} and RunTask(..., struct{}{}).
 type Task[I, O any] interface {
 	// Exec performs the task logic. ctx is cancelled when the task timeout
 	// elapses or the engine is closed. s is the StepRunner bound to this
@@ -69,6 +71,7 @@ func (f TaskFunc[I, O]) Exec(ctx context.Context, s *StepRunner, input I) (O, er
 
 // Func wraps a plain function as a Task, triggering Go's generic type
 // inference so callers do not need to specify type parameters explicitly.
+// in I is the single task input; see Task and RunTask.
 func Func[I, O any](fn func(ctx context.Context, s *StepRunner, in I) (O, error)) TaskFunc[I, O] {
 	return TaskFunc[I, O](fn)
 }
@@ -117,9 +120,11 @@ type taskEntry struct {
 }
 
 // RegisterTask stores taskID → (closure + config) in the in-memory registry.
-// Must be called before RunTask. Re-registering the same taskID returns
-// ErrTaskAlreadyRegistered. The registry is not persisted; call this again
-// after every NewEngine. taskID must not contain path separators or ':'.
+// Must be called before RunTask. I is the single task input type (one
+// struct of fields, or struct{} if the task has no payload). Re-registering
+// the same taskID returns ErrTaskAlreadyRegistered. The registry is not
+// persisted; call this again after every NewEngine. taskID must not contain
+// path separators or ':'.
 func RegisterTask[I, O any](e *Engine, taskID string, task Task[I, O], opts ...TaskOption) error {
 	if err := validateTaskID(taskID); err != nil {
 		return err
@@ -327,7 +332,9 @@ func finishedTaskRun[O any](runID string, status TaskStatus, output []byte, err 
 }
 
 // RunTask starts or resumes a run in a background goroutine and returns
-// immediately. On first start the input is written to input.json. The same
+// immediately. input is one typed value I — not variadic args. Put several
+// fields on one struct; a task with no payload uses struct{} and
+// struct{}{}. On first start the value is written to input.json. The same
 // runID reloads that file and ignores the input argument. Pass an empty
 // runID to resume the oldest active run for taskID, or to generate a new
 // ULID if none is active. A completed or failed run returns the stored
@@ -642,8 +649,8 @@ func (e *Engine) GetTask(ctx context.Context, taskID, runID string) (TaskInfo, b
 	return loadMeta(e.dataDir, taskID, runID)
 }
 
-// LoadInput returns the JSON-encoded task input written on first RunTask.
-// (nil, false, nil) if input.json is missing.
+// LoadInput returns the JSON-encoded task input written on first RunTask
+// (one I value). (nil, false, nil) if input.json is missing.
 func (e *Engine) LoadInput(ctx context.Context, taskID, runID string) ([]byte, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -1035,8 +1042,8 @@ func (r *ReadOnlyEngine) GetTask(ctx context.Context, taskID, runID string) (Tas
 	return loadMeta(r.dataDir, taskID, runID)
 }
 
-// LoadInput returns the JSON-encoded task input written on first RunTask.
-// Same semantics as Engine.LoadInput.
+// LoadInput returns the JSON-encoded task input written on first RunTask
+// (one I value). Same semantics as Engine.LoadInput.
 func (r *ReadOnlyEngine) LoadInput(ctx context.Context, taskID, runID string) ([]byte, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err

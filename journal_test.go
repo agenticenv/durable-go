@@ -19,6 +19,8 @@ import (
 func TestMakeReadFrame_RoundTrip(t *testing.T) {
 	rec := StepRecord{
 		StepID:      "charge",
+		Version:     "2",
+		Input:       []byte(`{"amount":10}`),
 		Status:      StepStatusCompleted,
 		Result:      []byte(`"ok"`),
 		StartedAt:   time.Unix(0, 1_700_000_000_000_000_000).UTC(),
@@ -44,11 +46,14 @@ func TestMakeReadFrame_RoundTrip(t *testing.T) {
 		t.Fatal("expected step entry")
 	}
 	back := protoToStep(got.GetStep())
-	if back.StepID != rec.StepID || back.Status != rec.Status {
+	if back.StepID != rec.StepID || back.Status != rec.Status || back.Version != rec.Version {
 		t.Fatalf("round-trip mismatch: got %+v want %+v", back, rec)
 	}
 	if !bytes.Equal(back.Result, rec.Result) {
 		t.Fatalf("result mismatch: %q vs %q", back.Result, rec.Result)
+	}
+	if !bytes.Equal(back.Input, rec.Input) {
+		t.Fatalf("input mismatch: %q vs %q", back.Input, rec.Input)
 	}
 }
 

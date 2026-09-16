@@ -36,9 +36,10 @@ enum StepStatus {
 //   4  result
 //   5  error
 //   6  panic_trace
-//   7  input_hash
+//   7  version
 //   8  started_at_ns
 //   9  completed_at_ns
+//  10  input
 message StepEntry {
   reserved 2;
   reserved "seq";
@@ -59,9 +60,9 @@ message StepEntry {
   // panic_trace holds the recovered panic value and stack (if the step panicked).
   string panic_trace = 6;
 
-  // input_hash is a hash of the step input bytes; used to detect input change
-  // between retries. Empty in v1 because RunStep has no input parameter.
-  string input_hash = 7;
+  // version is the WithStepVersion string for this checkpoint. Empty when
+  // the caller did not set a version.
+  string version = 7;
 
   // started_at_ns is Unix time in nanoseconds when the step function was invoked.
   int64 started_at_ns = 8;
@@ -69,6 +70,9 @@ message StepEntry {
   // completed_at_ns is Unix time in nanoseconds when the step reached a terminal state.
   // Zero for waiting entries that have not yet completed.
   int64 completed_at_ns = 9;
+
+  // input is the JSON-marshalled step input (RunStep's in).
+  bytes input = 10;
 }
 
 // SignalEntry records an external completion payload for a waiting step.

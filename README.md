@@ -27,7 +27,7 @@
 - **Auto-purge** — optional background cleanup of old completed and failed runs.
 - **Flexible execution** — tasks as `durable.Func` closures or structs with `Exec`.
 
-> **Pre-1.0.** This is the first fully worked-through release of the step model (see [Resume](#resume) and [Writing tasks](#writing-tasks)); the on-disk journal format changed in this release and is not compatible with runs written by `v0.1.0`–`v0.1.2`. Upgrade only between clean runs.
+> **Pre-1.0.** `v0.1.0`–`v0.1.3` are retracted. Start from `v0.1.4`. Journals from `v0.1.3` still load; `v0.1.0`–`v0.1.2` are not compatible — upgrade those only between clean runs.
 
 ## Why durable-go
 
@@ -54,13 +54,13 @@ defer e.Close()
 
 err = durable.RegisterTask(e, "process-order", durable.Func(
     func(ctx context.Context, s *durable.StepRunner, in OrderInput) (OrderOutput, error) {
-        charged, err := durable.RunStep(ctx, s, "charge", func(ctx context.Context) (string, error) {
+        charged, err := durable.RunStep(ctx, s, "charge", in, func(ctx context.Context, in OrderInput) (string, error) {
             return chargeCard(in)
         }).Get(ctx)
         if err != nil {
             return OrderOutput{}, err
         }
-        shipped, err := durable.RunStep(ctx, s, "ship", func(ctx context.Context) (string, error) {
+        shipped, err := durable.RunStep(ctx, s, "ship", charged, func(ctx context.Context, charged string) (string, error) {
             return scheduleShip(charged)
         }).Get(ctx)
         if err != nil {
@@ -88,7 +88,7 @@ type Job struct {
 }
 
 func (j *Job) Exec(ctx context.Context, s *durable.StepRunner, id string) (string, error) {
-    return durable.RunStep(ctx, s, "notify", func(ctx context.Context) (string, error) {
+    return durable.RunStep(ctx, s, "notify", id, func(ctx context.Context, id string) (string, error) {
         return j.Mail.Send(ctx, id)
     }).Get(ctx)
 }
@@ -105,7 +105,7 @@ Full example: [`examples/struct-task/`](examples/struct-task/).
 A step suspends itself by returning `ErrStepPending`. This blocks only that step's `Get` — sibling steps started before it keep running. An external caller completes it with the token from `StepToken(ctx)`:
 
 ```go
-approval, err := durable.RunStep(ctx, s, "approve", func(ctx context.Context) (Approval, error) {
+approval, err := durable.RunStep(ctx, s, "approve", struct{}{}, func(ctx context.Context, _ struct{}) (Approval, error) {
     token := s.StepToken(ctx)
     sendEmail("manager@co.com", token)
     return Approval{}, durable.ErrStepPending
@@ -120,10 +120,10 @@ durable.CompleteStep(ctx, e, token, Approval{By: "manager@co.com"})
 `RunStep` starts work and returns immediately — the same shape as `RunTask`. Start several steps before calling `Get` on any of them to run them concurrently, then join:
 
 ```go
-charge := durable.RunStep(ctx, s, "charge", func(ctx context.Context) (string, error) {
+charge := durable.RunStep(ctx, s, "charge", order, func(ctx context.Context, order Order) (string, error) {
     return chargeCard(order)
 })
-notify := durable.RunStep(ctx, s, "notify", func(ctx context.Context) (string, error) {
+notify := durable.RunStep(ctx, s, "notify", order, func(ctx context.Context, order Order) (string, error) {
     return sendReceipt(order)
 })
 chargeResult, err := charge.Get(ctx)
@@ -136,8 +136,8 @@ notifyResult, err := notify.Get(ctx)
 To react to whichever of several steps finishes first, `select` on `Done()` instead of blocking on `Get`:
 
 ```go
-a := durable.RunStep(ctx, s, "provider-a", callProviderA)
-b := durable.RunStep(ctx, s, "provider-b", callProviderB)
+a := durable.RunStep(ctx, s, "provider-a", req, callProviderA)
+b := durable.RunStep(ctx, s, "provider-b", req, callProviderB)
 select {
 case <-a.Done():
     result, err := a.Get(ctx)
@@ -200,7 +200,10 @@ Also:
 - **Step IDs are the resume key — never rename one.** The journal matches records by stepID string only. Renaming a step between deploys orphans the old result: on the next run `fn` executes again under the new name as if it had never run. Treat a stepID like a database column name, not a display label.
 - **Concurrent `RunStep` calls are safe.** Start several steps before `Get`-ing any of them to fan out; join with `Get` or `select` on `Done()`. A duplicate stepID within one run still panics.
 - **One stepID is reserved.** `RunStep` panics if `stepID` is `"\x00cancel"` — it is reserved internally for `CancelRun`'s durable signal. Any human-readable stepID you would actually choose is unaffected.
-- **JSON results** — step and task outputs must be JSON-marshalable.
+- **JSON results** — step and task outputs must be JSON-marshalable. Step input `in` must be too.
+- **One task input** — `I` is a single value, not variadic args. Bundle multiple fields in one struct; a task with no payload uses `struct{}` and `struct{}{}`.
+- **One step input** — `in` is a single value, not variadic args. Bundle multiple fields in one struct. No payload: `struct{}` and `struct{}{}`. Stored for inspect.
+- **Bump step version on the next deploy** — resume returns the cached result if `stepID` is unchanged, even when `fn` or `in` changed. If this step’s **code or params** change and in-flight runs must re-execute it, set `WithStepVersion` to a new string (`"1"` → `"2"`) or rename the stepID (`charge` → `charge-v2`). Same version (or no version) = cache. Side effects on re-run are the caller’s problem (idempotent steps).
 - **Same runID to resume** — `input.json` is reloaded; you do not need to pass the original input again.
 
 ## Examples

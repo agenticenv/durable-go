@@ -2,11 +2,10 @@ module github.com/agenticenv/durable-go
 
 go 1.26.5
 
-// Retract v0.1.0 through v0.1.2: v0.1.3 changed the step model to async
-// RunStep + Get (matching RunTask) and rewrote the journal wire format
-// (StepEntry dropped its seq field). Runs written by these versions are not
-// forward-compatible. Upgrade directly to v0.1.3 or later on a clean journal.
-retract [v0.1.0, v0.1.2]
+// Retract v0.1.0 through v0.1.3: v0.1.0–v0.1.2 rewrote the journal
+// (async RunStep + dropped seq). v0.1.3 is the last release before
+// typed step input and WithStepVersion. Start from v0.1.4.
+retract [v0.1.0, v0.1.3]
 
 require (
 	github.com/gofrs/flock v0.13.1

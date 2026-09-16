@@ -133,6 +133,32 @@ func TestInspect_DURABLE_DIR(t *testing.T) {
 	}
 }
 
+func TestInspect_StepInputAndVersion(t *testing.T) {
+	dir := t.TempDir()
+	seedJournal(t, dir)
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	if code := run([]string{"-d", dir, "step", "get", "echo", "run-1", "say"}, stdout, stderr, func(string) string { return "" }); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "VERSION:") || !strings.Contains(out, "1") {
+		t.Fatalf("missing version:\n%s", out)
+	}
+	if !strings.Contains(out, "INPUT:") || !strings.Contains(out, "hello") {
+		t.Fatalf("missing input:\n%s", out)
+	}
+
+	stdout.Reset()
+	if code := run([]string{"-d", dir, "step", "list", "echo", "run-1"}, stdout, stderr, func(string) string { return "" }); code != 0 {
+		t.Fatalf("list exit=%d stderr=%s", code, stderr)
+	}
+	list := stdout.String()
+	if !strings.Contains(list, "VERSION") || !strings.Contains(list, "INPUT") {
+		t.Fatalf("list:\n%s", list)
+	}
+}
+
 func TestInspect_MissingDir(t *testing.T) {
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 	code := run([]string{"task", "list"}, stdout, stderr, func(string) string { return "" })
@@ -170,9 +196,9 @@ func seedJournal(t *testing.T, dir string) {
 		t.Fatal(err)
 	}
 	task := durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		return durable.RunStep(ctx, s, "say", func(context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "say", in, func(_ context.Context, in string) (string, error) {
 			return in, nil
-		}).Get(ctx)
+		}, durable.WithStepVersion("1")).Get(ctx)
 	})
 	if err := durable.RegisterTask(e, "echo", task, durable.WithName("Echo Task")); err != nil {
 		t.Fatal(err)

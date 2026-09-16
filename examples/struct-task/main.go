@@ -61,7 +61,7 @@ type AgentRunner struct {
 }
 
 func (r *AgentRunner) Exec(ctx context.Context, s *durable.StepRunner, in AgentInput) (AgentOutput, error) {
-	uctx, err := durable.RunStep(ctx, s, "fetch-user-context", func(ctx context.Context) (UserContext, error) {
+	uctx, err := durable.RunStep(ctx, s, "fetch-user-context", in, func(ctx context.Context, in AgentInput) (UserContext, error) {
 		history, err := r.DB.FetchContext(ctx, in.UserID)
 		if err != nil {
 			return UserContext{}, fmt.Errorf("fetch context: %w", err)
@@ -73,7 +73,7 @@ func (r *AgentRunner) Exec(ctx context.Context, s *durable.StepRunner, in AgentI
 	}
 
 	prompt := fmt.Sprintf("Context: %s\nQuery: %s", uctx.History, in.Query)
-	completion, err := durable.RunStep(ctx, s, "run-llm-completion", func(ctx context.Context) (LLMCompletion, error) {
+	completion, err := durable.RunStep(ctx, s, "run-llm-completion", struct{}{}, func(ctx context.Context, _ struct{}) (LLMCompletion, error) {
 		resp, err := r.AI.Complete(ctx, prompt)
 		if err != nil {
 			return LLMCompletion{}, fmt.Errorf("llm completion: %w", err)
@@ -84,7 +84,7 @@ func (r *AgentRunner) Exec(ctx context.Context, s *durable.StepRunner, in AgentI
 		return AgentOutput{}, err
 	}
 
-	_, err = durable.RunStep(ctx, s, "persist-memory", func(ctx context.Context) (struct{}, error) {
+	_, err = durable.RunStep(ctx, s, "persist-memory", struct{}{}, func(ctx context.Context, _ struct{}) (struct{}, error) {
 		if err := r.DB.SaveMemory(ctx, in.UserID, completion.Response); err != nil {
 			return struct{}{}, fmt.Errorf("persist memory: %w", err)
 		}

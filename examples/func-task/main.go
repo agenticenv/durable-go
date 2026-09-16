@@ -36,7 +36,7 @@ var processPayment = durable.Func(func(
 	req PaymentRequest,
 ) (PaymentReceipt, error) {
 
-	_, err := durable.RunStep(ctx, s, "validate-input", func(ctx context.Context) (struct{}, error) {
+	_, err := durable.RunStep(ctx, s, "validate-input", req, func(ctx context.Context, req PaymentRequest) (struct{}, error) {
 		if req.Amount <= 0 {
 			return struct{}{}, fmt.Errorf("invalid amount: %.2f", req.Amount)
 		}
@@ -50,7 +50,7 @@ var processPayment = durable.Func(func(
 		return PaymentReceipt{}, err
 	}
 
-	charge, err := durable.RunStep(ctx, s, "charge-stripe", func(ctx context.Context) (ChargeResult, error) {
+	charge, err := durable.RunStep(ctx, s, "charge-stripe", req, func(ctx context.Context, req PaymentRequest) (ChargeResult, error) {
 		log.Printf("[charge-stripe] charging %.2f for order=%s …", req.Amount, req.OrderID)
 		return ChargeResult{ChargeID: "ch_" + req.OrderID, Status: "succeeded"}, nil
 	}).Get(ctx)
@@ -58,7 +58,7 @@ var processPayment = durable.Func(func(
 		return PaymentReceipt{}, err
 	}
 
-	receipt, err := durable.RunStep(ctx, s, "send-receipt", func(ctx context.Context) (PaymentReceipt, error) {
+	receipt, err := durable.RunStep(ctx, s, "send-receipt", struct{}{}, func(ctx context.Context, _ struct{}) (PaymentReceipt, error) {
 		log.Printf("[send-receipt] emailing %s for charge=%s …", req.Email, charge.ChargeID)
 		return PaymentReceipt{ChargeID: charge.ChargeID, Email: req.Email, Sent: true}, nil
 	}).Get(ctx)

@@ -78,7 +78,7 @@ Columns: `TASK_ID`, `RUN_ID`, `NAME`, `STATUS`, `CREATED`.
 
 ### `task get`
 
-One run: metadata, **task input** (`input.json`), then its steps. Step inputs are not stored (v1); only step results.
+One run: metadata, **task input** (`input.json` — one JSON value for `I`; `{}` when the task used `struct{}`), then its steps. Step input and version are stored on each step record when set.
 
 ```bash
 # task ID — if several runs share it, the table is printed and the command exits 1
@@ -98,7 +98,7 @@ With one argument, the value is matched against **task ID**, **run ID**, or **na
 
 ### `step list`
 
-Steps for one run (`STEP_ID`, `STATUS`, `STARTED`, `COMPLETED`).
+Steps for one run (`STEP_ID`, `STATUS`, `VERSION`, `INPUT`, `STARTED`, `COMPLETED`).
 
 ```bash
 ./bin/durable-inspect -d ./data step list echo run-1
@@ -106,7 +106,7 @@ Steps for one run (`STEP_ID`, `STATUS`, `STARTED`, `COMPLETED`).
 
 ### `step get`
 
-One step, including `RESULT` / `ERROR` when present.
+One step, including `VERSION` / `INPUT` / `RESULT` / `ERROR` when present.
 
 ```bash
 ./bin/durable-inspect -d ./data step get echo run-1 say

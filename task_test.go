@@ -17,7 +17,7 @@ import (
 
 func identityTask() durable.TaskFunc[string, string] {
 	return durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		return durable.RunStep(ctx, s, "echo", func(ctx context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "echo", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return in, nil
 		}).Get(ctx)
 	})
@@ -187,7 +187,7 @@ func TestRunTask_IdempotentRunID(t *testing.T) {
 	var n atomic.Int32
 	if err := durable.RegisterTask(e, "once", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		n.Add(1)
-		return durable.RunStep(ctx, s, "s", func(ctx context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "s", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return in, nil
 		}).Get(ctx)
 	})); err != nil {
@@ -241,14 +241,14 @@ func TestRunTask_ResumeReplaysSteps(t *testing.T) {
 	ctx := context.Background()
 	var steps atomic.Int32
 	task := durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		a, err := durable.RunStep(ctx, s, "one", func(ctx context.Context) (string, error) {
+		a, err := durable.RunStep(ctx, s, "one", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			steps.Add(1)
 			return "A", nil
 		}).Get(ctx)
 		if err != nil {
 			return "", err
 		}
-		b, err := durable.RunStep(ctx, s, "two", func(ctx context.Context) (string, error) {
+		b, err := durable.RunStep(ctx, s, "two", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			steps.Add(1)
 			return a + "B", nil
 		}).Get(ctx)
@@ -300,7 +300,7 @@ func TestRunTask_ResumeUsesStoredInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := durable.RegisterTask(e1, "echo-in", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+		_, err := durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return "", durable.ErrStepPending
 		}).Get(ctx)
 		return in, err
@@ -322,7 +322,7 @@ func TestRunTask_ResumeUsesStoredInput(t *testing.T) {
 	}
 	defer func() { _ = e2.Close() }()
 	if err := durable.RegisterTask(e2, "echo-in", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+		_, err := durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return "", durable.ErrStepPending
 		}).Get(ctx)
 		return in, err
@@ -347,7 +347,7 @@ func TestRunTask_EmptyRunIDResumesOldestActive(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "single", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		token := ""
-		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+		_, err := durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			token = s.StepToken(ctx)
 			return "", durable.ErrStepPending
 		}).Get(ctx)
@@ -418,7 +418,7 @@ func TestRunTask_PurgeThenRetry(t *testing.T) {
 func TestRunTask_StaleDetectionViaListTasks(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "stale", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+		_, err := durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return "", durable.ErrStepPending
 		}).Get(ctx)
 		return "", err
@@ -518,7 +518,7 @@ func TestTaskRetries_DoNotRetryStepError(t *testing.T) {
 	var n atomic.Int32
 	if err := durable.RegisterTask(e, "sr", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		n.Add(1)
-		return durable.RunStep(ctx, s, "f", func(ctx context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "f", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return "", errors.New("step-fail")
 		}).Get(ctx)
 	}), durable.WithTaskMaxRetries(3)); err != nil {
@@ -596,10 +596,10 @@ func TestGetTask_NotFound(t *testing.T) {
 func TestLoadSteps_ContainsAllStepsAnyOrder(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
+		if _, err := durable.RunStep(ctx, s, "a", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "1", nil }).Get(ctx); err != nil {
 			return "", err
 		}
-		if _, err := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "2", nil }).Get(ctx); err != nil {
+		if _, err := durable.RunStep(ctx, s, "b", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "2", nil }).Get(ctx); err != nil {
 			return "", err
 		}
 		return "ok", nil
@@ -628,7 +628,7 @@ func TestLoadSteps_ContainsAllStepsAnyOrder(t *testing.T) {
 func TestGetStep_ByID(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "gs", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		return durable.RunStep(ctx, s, "only", func(ctx context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "only", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return "v", nil
 		}).Get(ctx)
 	})); err != nil {
@@ -752,10 +752,10 @@ func TestWatchSteps_Live(t *testing.T) {
 	release := make(chan struct{})
 	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		<-release
-		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
+		if _, err := durable.RunStep(ctx, s, "a", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "1", nil }).Get(ctx); err != nil {
 			return "", err
 		}
-		if _, err := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "2", nil }).Get(ctx); err != nil {
+		if _, err := durable.RunStep(ctx, s, "b", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "2", nil }).Get(ctx); err != nil {
 			return "", err
 		}
 		return "ok", nil
@@ -798,13 +798,13 @@ func TestWatchSteps_Live(t *testing.T) {
 func TestWatchSteps_FromOffset(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
+		if _, err := durable.RunStep(ctx, s, "a", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "1", nil }).Get(ctx); err != nil {
 			return "", err
 		}
-		if _, err := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "2", nil }).Get(ctx); err != nil {
+		if _, err := durable.RunStep(ctx, s, "b", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "2", nil }).Get(ctx); err != nil {
 			return "", err
 		}
-		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+		_, err := durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return "", durable.ErrStepPending
 		}).Get(ctx)
 		return "ok", err
@@ -831,13 +831,13 @@ func TestWatchSteps_FromOffset(t *testing.T) {
 func TestWatchSteps_FromByteOffset(t *testing.T) {
 	e := newTestEngine(t)
 	if err := durable.RegisterTask(e, "seq", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		if _, err := durable.RunStep(ctx, s, "a", func(ctx context.Context) (string, error) { return "1", nil }).Get(ctx); err != nil {
+		if _, err := durable.RunStep(ctx, s, "a", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "1", nil }).Get(ctx); err != nil {
 			return "", err
 		}
-		if _, err := durable.RunStep(ctx, s, "b", func(ctx context.Context) (string, error) { return "2", nil }).Get(ctx); err != nil {
+		if _, err := durable.RunStep(ctx, s, "b", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "2", nil }).Get(ctx); err != nil {
 			return "", err
 		}
-		_, err := durable.RunStep(ctx, s, "wait", func(ctx context.Context) (string, error) {
+		_, err := durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return "", durable.ErrStepPending
 		}).Get(ctx)
 		return "ok", err
@@ -980,7 +980,7 @@ func TestWatchSteps_SlowConsumerDropLogsWarning(t *testing.T) {
 		<-release
 		for i := 0; i < nSteps; i++ {
 			id := fmt.Sprintf("s%d", i)
-			if _, err := durable.RunStep(ctx, s, id, func(ctx context.Context) (string, error) { return "ok", nil }).Get(ctx); err != nil {
+			if _, err := durable.RunStep(ctx, s, id, struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "ok", nil }).Get(ctx); err != nil {
 				return "", err
 			}
 		}

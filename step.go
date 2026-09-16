@@ -34,7 +34,8 @@ const (
 // StepRecord is the latest persistent checkpoint for one memoised step.
 type StepRecord struct {
 	StepID      string
-	InputHash   string // unused in v1; RunStep has no input parameter
+	Version     string
+	Input       []byte
 	Result      []byte
 	Error       string
 	PanicTrace  string
@@ -46,6 +47,7 @@ type StepRecord struct {
 type stepConfig struct {
 	timeout    *time.Duration
 	maxRetries *int
+	version    string
 }
 
 // StepOption configures a single RunStep call.
@@ -66,6 +68,15 @@ func WithStepTimeout(d time.Duration) StepOption {
 // Does not inherit from task or engine retry settings.
 func WithStepMaxRetries(n int) StepOption {
 	return func(c *stepConfig) { c.maxRetries = &n }
+}
+
+// WithStepVersion tags this step so a later deploy can opt into re-running it.
+// Resume still returns the cached result when the stored version equals v.
+// If this step's code or params change and in-flight runs must re-execute it,
+// pass a new v ("1" → "2") or rename the stepID. Empty v is a no-op (cache
+// by stepID only). Side effects on re-run are the caller's problem.
+func WithStepVersion(v string) StepOption {
+	return func(c *stepConfig) { c.version = v }
 }
 
 type stepIDKey struct{}
@@ -192,9 +203,11 @@ func (s *StepRunner) persistRecord(rec StepRecord) error {
 // persistStarted is best-effort: a failure to write the watch-only STARTED
 // event must not stop the step from executing fn, and it is never placed in
 // s.cache (loadJournal's map skips StepStatusRunning entirely — see journal.go).
-func (s *StepRunner) persistStarted(stepID string, startedAt time.Time) {
+func (s *StepRunner) persistStarted(stepID string, startedAt time.Time, input []byte, version string) {
 	rec := StepRecord{
 		StepID:    stepID,
+		Version:   version,
+		Input:     input,
 		Status:    StepStatusRunning,
 		StartedAt: startedAt,
 	}
@@ -241,14 +254,18 @@ func (e *stepFailedError) Unwrap() error { return e.err }
 // RunStep starts fn as a memoised checkpoint and returns immediately.
 // Get waits for the result. On a completed or failed cache hit, fn is not
 // called. On a miss, fn runs on a goroutine and the result is persisted.
+// in is a single JSON-marshalable value (one struct of fields, or struct{}
+// if the step has no payload); it is stored on the record for inspect.
 // stepID must be unique within the run — a duplicate panics. Concurrent
 // calls on the same StepRunner are safe: start several steps, then Get them
 // in any order, or select on their Done channels for first-of-N.
 //
 // Step IDs are the resume key: never rename a stepID once a run has
 // started. A renamed step is treated as a new, unrelated step — the old
-// result is orphaned and fn runs again under the new name.
-func RunStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(ctx context.Context) (O, error), opts ...StepOption) *StepRun[O] {
+// result is orphaned and fn runs again under the new name. To re-run the
+// same stepID after a code or param change, pass WithStepVersion with a
+// new string.
+func RunStep[I, O any](ctx context.Context, s *StepRunner, stepID string, in I, fn func(ctx context.Context, in I) (O, error), opts ...StepOption) *StepRun[O] {
 	if stepID == "" {
 		panic("durable: step ID must not be empty")
 	}
@@ -258,6 +275,16 @@ func RunStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(c
 
 	stopCh := s.engine.stopCh
 	var zero O
+
+	cfg := stepConfig{}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	inputRaw, err := json.Marshal(in)
+	if err != nil {
+		return readyStepRun(stepID, stopCh, zero, fmt.Errorf("durable: step %q: marshal input: %w", stepID, err))
+	}
 
 	// Checked before every RunStep call — including replay of an already
 	// cached step, not just fresh work. Once ctx is cancelled (CancelRun,
@@ -276,7 +303,8 @@ func RunStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(c
 	rec, has := s.cache[stepID]
 	s.mu.Unlock()
 
-	if has && rec.Status == StepStatusCompleted {
+	hit := has && versionMatches(cfg.version, rec.Version)
+	if hit && rec.Status == StepStatusCompleted {
 		var out O
 		if err := json.Unmarshal(rec.Result, &out); err != nil {
 			return readyStepRun(stepID, stopCh, zero, fmt.Errorf("durable: replay step %q: unmarshal: %w", stepID, err))
@@ -284,7 +312,7 @@ func RunStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(c
 		s.logger.Debug("step replayed from cache", "step_id", stepID)
 		return readyStepRun(stepID, stopCh, out, nil)
 	}
-	if has && rec.Status == StepStatusFailed {
+	if hit && rec.Status == StepStatusFailed {
 		err := errors.New(rec.Error)
 		if rec.Error == "" {
 			err = fmt.Errorf("durable: step %q failed", stepID)
@@ -293,22 +321,24 @@ func RunStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(c
 		return readyStepRun(stepID, stopCh, zero, &stepFailedError{stepID: stepID, err: err})
 	}
 
-	cfg := stepConfig{}
-	for _, o := range opts {
-		o(&cfg)
-	}
-
 	run := &StepRun[O]{stepID: stepID, done: make(chan struct{}), stopCh: stopCh}
 	s.inFlight.Add(1)
 	go func() {
 		defer s.inFlight.Done()
 		defer close(run.done)
-		run.result, run.err = execStep[O](ctx, s, stepID, fn, cfg, rec, has)
+		run.result, run.err = execStep(ctx, s, stepID, in, inputRaw, fn, cfg, rec, has)
 	}()
 	return run
 }
 
-func execStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(context.Context) (O, error), cfg stepConfig, rec StepRecord, has bool) (O, error) {
+func versionMatches(want, stored string) bool {
+	if want == "" {
+		return true
+	}
+	return stored != "" && stored == want
+}
+
+func execStep[I, O any](ctx context.Context, s *StepRunner, stepID string, in I, input []byte, fn func(context.Context, I) (O, error), cfg stepConfig, rec StepRecord, has bool) (O, error) {
 	var zero O
 	stepCtx := withStepID(ctx, stepID)
 	var cancel context.CancelFunc
@@ -321,7 +351,7 @@ func execStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(
 		if err := s.addWaiting(); err != nil {
 			return zero, err
 		}
-		return waitForSignal[O](stepCtx, s, stepID, rec.StartedAt)
+		return waitForSignal[O](stepCtx, s, stepID, rec.StartedAt, rec.Input, rec.Version)
 	}
 
 	maxRetries := 0
@@ -338,7 +368,7 @@ func execStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(
 	}
 
 	startedAt := time.Now().UTC()
-	s.persistStarted(stepID, startedAt)
+	s.persistStarted(stepID, startedAt, input, cfg.version)
 
 	var (
 		out        O
@@ -347,17 +377,17 @@ func execStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(
 	)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		out, panicTrace, fnErr = invokeStep(stepCtx, stepID, fn)
+		out, panicTrace, fnErr = invokeStep(stepCtx, stepID, in, fn)
 		if panicTrace != "" {
-			s.persistFailed(stepID, startedAt, fnErr, panicTrace)
+			s.persistFailed(stepID, startedAt, fnErr, panicTrace, input, cfg.version)
 			return zero, &stepFailedError{stepID: stepID, err: fnErr}
 		}
 		if errors.Is(fnErr, ErrStepPending) {
-			return enterPending[O](stepCtx, s, stepID, startedAt)
+			return enterPending[O](stepCtx, s, stepID, startedAt, input, cfg.version)
 		}
 		if fnErr != nil {
 			if stepCtx.Err() != nil || attempt == maxRetries {
-				s.persistFailed(stepID, startedAt, fnErr, "")
+				s.persistFailed(stepID, startedAt, fnErr, "", input, cfg.version)
 				return zero, &stepFailedError{stepID: stepID, err: fnErr}
 			}
 			s.logger.Warn("step retrying", "step_id", stepID, "attempt", attempt+1, "error", fnErr)
@@ -373,6 +403,8 @@ func execStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(
 	completedAt := time.Now().UTC()
 	completed := StepRecord{
 		StepID:      stepID,
+		Version:     cfg.version,
+		Input:       input,
 		Status:      StepStatusCompleted,
 		Result:      raw,
 		StartedAt:   startedAt,
@@ -385,7 +417,7 @@ func execStep[O any](ctx context.Context, s *StepRunner, stepID string, fn func(
 	return out, nil
 }
 
-func invokeStep[O any](ctx context.Context, stepID string, fn func(context.Context) (O, error)) (out O, panicTrace string, fnErr error) {
+func invokeStep[I, O any](ctx context.Context, stepID string, in I, fn func(context.Context, I) (O, error)) (out O, panicTrace string, fnErr error) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -393,14 +425,16 @@ func invokeStep[O any](ctx context.Context, stepID string, fn func(context.Conte
 				fnErr = fmt.Errorf("durable: step %q panicked: %v", stepID, r)
 			}
 		}()
-		out, fnErr = fn(ctx)
+		out, fnErr = fn(ctx, in)
 	}()
 	return out, panicTrace, fnErr
 }
 
-func (s *StepRunner) persistFailed(stepID string, startedAt time.Time, fnErr error, panicTrace string) {
+func (s *StepRunner) persistFailed(stepID string, startedAt time.Time, fnErr error, panicTrace string, input []byte, version string) {
 	rec := StepRecord{
 		StepID:      stepID,
+		Version:     version,
+		Input:       input,
 		Status:      StepStatusFailed,
 		Error:       fnErr.Error(),
 		PanicTrace:  panicTrace,
@@ -417,10 +451,12 @@ func (s *StepRunner) persistFailed(stepID string, startedAt time.Time, fnErr err
 	}
 }
 
-func enterPending[O any](ctx context.Context, s *StepRunner, stepID string, startedAt time.Time) (O, error) {
+func enterPending[O any](ctx context.Context, s *StepRunner, stepID string, startedAt time.Time, input []byte, version string) (O, error) {
 	var zero O
 	waiting := StepRecord{
 		StepID:    stepID,
+		Version:   version,
+		Input:     input,
 		Status:    StepStatusWaiting,
 		StartedAt: startedAt,
 	}
@@ -432,10 +468,10 @@ func enterPending[O any](ctx context.Context, s *StepRunner, stepID string, star
 		return zero, err
 	}
 	s.logger.Info("step waiting", "step_id", stepID)
-	return waitForSignal[O](ctx, s, stepID, startedAt)
+	return waitForSignal[O](ctx, s, stepID, startedAt, input, version)
 }
 
-func waitForSignal[O any](ctx context.Context, s *StepRunner, stepID string, startedAt time.Time) (O, error) {
+func waitForSignal[O any](ctx context.Context, s *StepRunner, stepID string, startedAt time.Time, input []byte, version string) (O, error) {
 	var zero O
 	key := s.taskID + "/" + s.runID + "/" + stepID
 	ch := make(chan []byte, 1)
@@ -472,6 +508,8 @@ func waitForSignal[O any](ctx context.Context, s *StepRunner, stepID string, sta
 	completedAt := time.Now().UTC()
 	rec := StepRecord{
 		StepID:      stepID,
+		Version:     version,
+		Input:       input,
 		Status:      StepStatusCompleted,
 		Result:      payload,
 		StartedAt:   startedAt,

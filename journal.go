@@ -516,7 +516,8 @@ func stepToProto(r StepRecord) *durablepb.StepEntry {
 		Result:     r.Result,
 		Error:      r.Error,
 		PanicTrace: r.PanicTrace,
-		InputHash:  r.InputHash,
+		Version:    r.Version,
+		Input:      r.Input,
 	}
 	if !r.StartedAt.IsZero() {
 		e.StartedAtNs = r.StartedAt.UnixNano()
@@ -534,7 +535,8 @@ func protoToStep(e *durablepb.StepEntry) StepRecord {
 		Result:     e.GetResult(),
 		Error:      e.GetError(),
 		PanicTrace: e.GetPanicTrace(),
-		InputHash:  e.GetInputHash(),
+		Version:    e.GetVersion(),
+		Input:      e.GetInput(),
 	}
 	if e.GetStartedAtNs() != 0 {
 		r.StartedAt = time.Unix(0, e.GetStartedAtNs()).UTC()

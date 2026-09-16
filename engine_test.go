@@ -78,8 +78,8 @@ func TestEngine_CloseDrainsInFlightSteps(t *testing.T) {
 	started := make(chan struct{})
 	var finished atomic.Bool
 	if err := durable.RegisterTask(e, "drain", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		x := durable.RunStep(ctx, s, "fast", func(ctx context.Context) (string, error) { return "ok", nil })
-		y := durable.RunStep(ctx, s, "slow", func(ctx context.Context) (string, error) {
+		x := durable.RunStep(ctx, s, "fast", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) { return "ok", nil })
+		y := durable.RunStep(ctx, s, "slow", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			close(started)
 			<-ctx.Done()
 			finished.Store(true)
@@ -286,7 +286,7 @@ func TestCancelRun_LiveInFlightStepObservesCancellation(t *testing.T) {
 	var observedCancel atomic.Bool
 
 	if err := durable.RegisterTask(e, "cancel-live", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		return durable.RunStep(ctx, s, "block", func(ctx context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "block", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			close(started)
 			<-ctx.Done()
 			observedCancel.Store(true)
@@ -334,7 +334,7 @@ func TestCancelRun_SubsequentRunStepFailsFast(t *testing.T) {
 	var secondStepCalled atomic.Bool
 
 	if err := durable.RegisterTask(e, "cancel-chain", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		_, err := durable.RunStep(ctx, s, "block", func(ctx context.Context) (string, error) {
+		_, err := durable.RunStep(ctx, s, "block", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			close(started)
 			<-ctx.Done()
 			return "", ctx.Err()
@@ -342,7 +342,7 @@ func TestCancelRun_SubsequentRunStepFailsFast(t *testing.T) {
 		if err == nil {
 			t.Error("expected first step to fail")
 		}
-		_, err2 := durable.RunStep(ctx, s, "second", func(ctx context.Context) (string, error) {
+		_, err2 := durable.RunStep(ctx, s, "second", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			secondStepCalled.Store(true)
 			return "should not run", nil
 		}).Get(ctx)
@@ -386,7 +386,7 @@ func TestCancelRun_SurvivesCrashResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := durable.RegisterTask(e1, "cancel-resume", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		return durable.RunStep(ctx, s, "work", func(ctx context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "work", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			calls.Add(1)
 			return "", durable.ErrStepPending
 		}).Get(ctx)
@@ -411,7 +411,7 @@ func TestCancelRun_SurvivesCrashResume(t *testing.T) {
 	}
 	defer func() { _ = e2.Close() }()
 	if err := durable.RegisterTask(e2, "cancel-resume", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		return durable.RunStep(ctx, s, "work", func(ctx context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "work", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			calls.Add(1)
 			return "", durable.ErrStepPending
 		}).Get(ctx)
@@ -474,7 +474,7 @@ func TestCancelRun_Idempotent(t *testing.T) {
 	started := make(chan struct{})
 
 	if err := durable.RegisterTask(e, "cancel-twice", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
-		return durable.RunStep(ctx, s, "block", func(ctx context.Context) (string, error) {
+		return durable.RunStep(ctx, s, "block", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			close(started)
 			<-ctx.Done()
 			return "", ctx.Err()

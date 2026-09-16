@@ -15,12 +15,12 @@ import (
 func run(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
 	p, err := parseArgs(args)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, usage)
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, usage)
 		return 2
 	}
 	if p.help || len(p.rest) == 0 {
-		fmt.Fprint(stdout, usage)
+		_, _ = fmt.Fprint(stdout, usage)
 		if p.help {
 			return 0
 		}
@@ -28,9 +28,9 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string) in
 	}
 
 	if err := dispatch(p, stdout, getenv); err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		if errors.Is(err, errUsage) {
-			fmt.Fprint(stderr, usage)
+			_, _ = fmt.Fprint(stderr, usage)
 			return 2
 		}
 		return 1
@@ -47,7 +47,7 @@ func dispatch(p parsedArgs, stdout io.Writer, getenv func(string) string) error 
 	noun, verb := p.rest[0], p.rest[1]
 	ids := p.rest[2:]
 
-	if p.status != "" && !(noun == "task" && verb == "list") {
+	if p.status != "" && (noun != "task" || verb != "list") {
 		return fmt.Errorf("%w: --status is only valid on task list", errUsage)
 	}
 
@@ -138,7 +138,7 @@ func cmdTaskGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, ids
 			return fmt.Errorf("no task matching %q (task ID, run ID, or name)", ids[0])
 		}
 		if len(matches) > 1 {
-			fmt.Fprintf(w, "multiple runs match %q; pass task ID and run ID:\n", ids[0])
+			_, _ = fmt.Fprintf(w, "multiple runs match %q; pass task ID and run ID:\n", ids[0])
 			printTaskTable(w, matches)
 			return fmt.Errorf("multiple runs match %q", ids[0])
 		}
@@ -178,42 +178,48 @@ func cmdStepGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, tas
 	if !ok {
 		return fmt.Errorf("step %q not found on task %s / run %s", stepID, taskID, runID)
 	}
-	fmt.Fprintf(w, "STEP_ID:\t%s\n", rec.StepID)
-	fmt.Fprintf(w, "STATUS:\t%s\n", rec.Status)
-	fmt.Fprintf(w, "STARTED:\t%s\n", fmtTime(rec.StartedAt))
-	fmt.Fprintf(w, "COMPLETED:\t%s\n", fmtTime(rec.CompletedAt))
+	_, _ = fmt.Fprintf(w, "STEP_ID:\t%s\n", rec.StepID)
+	_, _ = fmt.Fprintf(w, "STATUS:\t%s\n", rec.Status)
+	if rec.Version != "" {
+		_, _ = fmt.Fprintf(w, "VERSION:\t%s\n", rec.Version)
+	}
+	if len(rec.Input) > 0 {
+		_, _ = fmt.Fprintf(w, "INPUT:\t%s\n", fmtResult(rec.Input))
+	}
+	_, _ = fmt.Fprintf(w, "STARTED:\t%s\n", fmtTime(rec.StartedAt))
+	_, _ = fmt.Fprintf(w, "COMPLETED:\t%s\n", fmtTime(rec.CompletedAt))
 	if rec.Error != "" {
-		fmt.Fprintf(w, "ERROR:\t%s\n", rec.Error)
+		_, _ = fmt.Fprintf(w, "ERROR:\t%s\n", rec.Error)
 	}
 	if rec.PanicTrace != "" {
-		fmt.Fprintf(w, "PANIC:\t%s\n", rec.PanicTrace)
+		_, _ = fmt.Fprintf(w, "PANIC:\t%s\n", rec.PanicTrace)
 	}
 	if len(rec.Result) > 0 {
-		fmt.Fprintf(w, "RESULT:\t%s\n", fmtResult(rec.Result))
+		_, _ = fmt.Fprintf(w, "RESULT:\t%s\n", fmtResult(rec.Result))
 	}
 	return nil
 }
 
 func printTaskDetail(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, t durable.TaskInfo) error {
-	fmt.Fprintf(w, "TASK_ID:\t%s\n", t.TaskID)
-	fmt.Fprintf(w, "RUN_ID:\t%s\n", t.RunID)
-	fmt.Fprintf(w, "NAME:\t%s\n", t.Name)
-	fmt.Fprintf(w, "STATUS:\t%s\n", t.Status)
-	fmt.Fprintf(w, "CREATED:\t%s\n", fmtTime(t.CreatedAt))
-	fmt.Fprintf(w, "STARTED:\t%s\n", fmtTime(t.StartedAt))
-	fmt.Fprintf(w, "COMPLETED:\t%s\n", fmtTime(t.CompletedAt))
+	_, _ = fmt.Fprintf(w, "TASK_ID:\t%s\n", t.TaskID)
+	_, _ = fmt.Fprintf(w, "RUN_ID:\t%s\n", t.RunID)
+	_, _ = fmt.Fprintf(w, "NAME:\t%s\n", t.Name)
+	_, _ = fmt.Fprintf(w, "STATUS:\t%s\n", t.Status)
+	_, _ = fmt.Fprintf(w, "CREATED:\t%s\n", fmtTime(t.CreatedAt))
+	_, _ = fmt.Fprintf(w, "STARTED:\t%s\n", fmtTime(t.StartedAt))
+	_, _ = fmt.Fprintf(w, "COMPLETED:\t%s\n", fmtTime(t.CompletedAt))
 	if t.Error != "" {
-		fmt.Fprintf(w, "ERROR:\t%s\n", t.Error)
+		_, _ = fmt.Fprintf(w, "ERROR:\t%s\n", t.Error)
 	}
 	if len(t.Tags) > 0 {
-		fmt.Fprintf(w, "TAGS:\t%v\n", t.Tags)
+		_, _ = fmt.Fprintf(w, "TAGS:\t%v\n", t.Tags)
 	}
 	in, ok, err := r.LoadInput(ctx, t.TaskID, t.RunID)
 	if err != nil {
 		return err
 	}
 	if ok {
-		fmt.Fprintf(w, "INPUT:\t%s\n", fmtResult(in))
+		_, _ = fmt.Fprintf(w, "INPUT:\t%s\n", fmtResult(in))
 	}
 	steps, err := r.LoadSteps(ctx, t.TaskID, t.RunID)
 	if err != nil {
@@ -222,25 +228,25 @@ func printTaskDetail(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer
 	if len(steps) == 0 {
 		return nil
 	}
-	fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w)
 	printStepTable(w, steps)
 	return nil
 }
 
 func printTaskTable(w io.Writer, tasks []durable.TaskInfo) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "TASK_ID\tRUN_ID\tNAME\tSTATUS\tCREATED")
+	_, _ = fmt.Fprintln(tw, "TASK_ID\tRUN_ID\tNAME\tSTATUS\tCREATED")
 	for _, t := range tasks {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", t.TaskID, t.RunID, t.Name, t.Status, fmtTime(t.CreatedAt))
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", t.TaskID, t.RunID, t.Name, t.Status, fmtTime(t.CreatedAt))
 	}
 	_ = tw.Flush()
 }
 
 func printStepTable(w io.Writer, steps []durable.StepRecord) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "STEP_ID\tSTATUS\tSTARTED\tCOMPLETED")
+	_, _ = fmt.Fprintln(tw, "STEP_ID\tSTATUS\tVERSION\tINPUT\tSTARTED\tCOMPLETED")
 	for _, s := range steps {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", s.StepID, s.Status, fmtTime(s.StartedAt), fmtTime(s.CompletedAt))
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", s.StepID, s.Status, s.Version, fmtResult(s.Input), fmtTime(s.StartedAt), fmtTime(s.CompletedAt))
 	}
 	_ = tw.Flush()
 }

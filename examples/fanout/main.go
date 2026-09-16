@@ -28,19 +28,19 @@ type OrderOutput struct {
 var tokenCh = make(chan string, 1)
 
 var processOrder = durable.Func(func(ctx context.Context, s *durable.StepRunner, in OrderInput) (OrderOutput, error) {
-	inventory := durable.RunStep(ctx, s, "check-inventory", func(ctx context.Context) (string, error) {
+	inventory := durable.RunStep(ctx, s, "check-inventory", in, func(ctx context.Context, in OrderInput) (string, error) {
 		log.Printf("  → [check-inventory]   checking stock for order %s …", in.OrderID)
 		time.Sleep(150 * time.Millisecond)
 		log.Printf("  ✓ [check-inventory]   in stock")
 		return "in-stock", nil
 	})
-	pricing := durable.RunStep(ctx, s, "quote-price", func(ctx context.Context) (string, error) {
+	pricing := durable.RunStep(ctx, s, "quote-price", in, func(ctx context.Context, in OrderInput) (string, error) {
 		log.Printf("  → [quote-price]       pricing order %s …", in.OrderID)
 		time.Sleep(60 * time.Millisecond)
 		log.Printf("  ✓ [quote-price]       done")
 		return "$42.00", nil
 	})
-	approval := durable.RunStep(ctx, s, "manager-approval", func(ctx context.Context) (string, error) {
+	approval := durable.RunStep(ctx, s, "manager-approval", in, func(ctx context.Context, _ OrderInput) (string, error) {
 		token := s.StepToken(ctx)
 		log.Printf("  ⏸ [manager-approval]  suspended — waiting for CompleteStep")
 		tokenCh <- token

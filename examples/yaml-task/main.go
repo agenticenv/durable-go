@@ -43,7 +43,7 @@ var runWorkflow = durable.Func(func(
 
 	for i, step := range wf.Steps {
 		step := step
-		out, err := durable.RunStep(ctx, s, step.ID, func(ctx context.Context) (string, error) {
+		out, err := durable.RunStep(ctx, s, step.ID, step, func(ctx context.Context, step Step) (string, error) {
 			log.Printf("  → [%s]  %s", step.ID, step.Run)
 			cmd := exec.CommandContext(ctx, "sh", "-c", step.Run)
 			var buf bytes.Buffer
@@ -63,7 +63,7 @@ var runWorkflow = durable.Func(func(
 
 		if crashAfter != "" && crashAfter == fmt.Sprintf("%d", i+1) {
 			log.Println()
-			log.Printf("💥  SIMULATED CRASH after step %d (%s)", crashAfter, step.ID)
+			log.Printf("💥  SIMULATED CRASH after step %s (%s)", crashAfter, step.ID)
 			log.Println("    Re-run without CRASH_AFTER to resume remaining steps.")
 			log.Println()
 			os.Exit(1)

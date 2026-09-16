@@ -9,7 +9,7 @@
 //
 //	_ = durable.RegisterTask(e, "process-order", durable.Func(
 //	    func(ctx context.Context, s *durable.StepRunner, in OrderInput) (OrderOutput, error) {
-//	        charged, err := durable.RunStep(ctx, s, "charge", func(ctx context.Context) (string, error) {
+//	        charged, err := durable.RunStep(ctx, s, "charge", in, func(ctx context.Context, in OrderInput) (string, error) {
 //	            return chargeCard(in)
 //	        }).Get(ctx)
 //	        if err != nil {
