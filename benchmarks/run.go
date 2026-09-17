@@ -57,12 +57,12 @@ func runNSteps(ctx context.Context, s *durable.StepRunner, in benchInput, steps 
 	return last, nil
 }
 
-var plainSink string
-
-func runPlain(steps int, payload string) {
+func runPlain(steps int, payload string) string {
+	var last string
 	for i := 0; i < steps; i++ {
-		plainSink = payload
+		last = payload
 	}
+	return last
 }
 
 func registerTask(e *durable.Engine, steps int, payload string, execs *atomic.Int64) error {

@@ -23,7 +23,7 @@ type config struct {
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintf(os.Stderr, "durable-go benchmark: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "durable-go benchmark: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -80,7 +80,7 @@ func run(args []string) error {
 
 	// Warmup (discarded).
 	for i := 0; i < cfg.warmup; i++ {
-		runPlain(cfg.steps, payload)
+		_ = runPlain(cfg.steps, payload)
 		runID := fmt.Sprintf("warmup-%d", i)
 		if err := runDurable(ctx, e, runID, cfg.steps); err != nil {
 			return fmt.Errorf("warmup durable: %w", err)
@@ -91,10 +91,14 @@ func run(args []string) error {
 	}
 
 	var plain, first, replay stats
+	var sink string
 	for i := 0; i < cfg.iters; i++ {
 		start := time.Now()
-		runPlain(cfg.steps, payload)
+		sink = runPlain(cfg.steps, payload)
 		plain.add(time.Since(start))
+	}
+	if cfg.steps > 0 && sink != payload {
+		return fmt.Errorf("plain run produced unexpected sink")
 	}
 
 	var lastRunID string
@@ -127,7 +131,9 @@ func run(args []string) error {
 		return fmt.Errorf("filesystem probe: %w", err)
 	}
 
-	writeReport(os.Stdout, cfg, dir, plain, first, replay, fs)
+	if err := writeReport(os.Stdout, cfg, dir, plain, first, replay, fs); err != nil {
+		return fmt.Errorf("write report: %w", err)
+	}
 	return nil
 }
 

@@ -27,8 +27,6 @@
 - **Auto-purge** — optional background cleanup of old completed and failed runs.
 - **Flexible execution** — tasks as `durable.Func` closures or structs with `Exec`.
 
-> **Pre-1.0.** `v0.1.0`–`v0.1.3` are retracted. Start from `v0.1.4`. Journals from `v0.1.3` still load; `v0.1.0`–`v0.1.2` are not compatible — upgrade those only between clean runs.
-
 ## Why durable-go
 
 Most durable-execution frameworks require external infrastructure—such as a dedicated workflow server or a Postgres database—and enforce strict code execution models like replay determinism.

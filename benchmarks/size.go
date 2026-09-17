@@ -34,7 +34,7 @@ func parsePayload(s string) (int, error) {
 	mult := 1.0
 	switch strings.TrimSpace(s[i:]) {
 	case "", "b", "byte", "bytes":
-		mult = 1
+		// keep 1.0
 	case "k", "kb", "kib":
 		mult = 1024
 	case "m", "mb", "mib":
