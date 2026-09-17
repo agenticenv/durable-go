@@ -197,6 +197,7 @@ Follow these when you write a task. On resume, the task runs again from the top;
 Also:
 
 - **Unique step IDs** — one stable string per step (literals or `fmt.Sprintf("step-%d", i)`). Reusing an ID panics.
+- **Bound the steps in one run.** Resume scans that run’s `journal.log`. A fixed list of steps (including `fmt.Sprintf("step-%d", i)` with a known N) is fine. Do not put an unbounded loop of new step IDs in one run. Start a new `RunTask` when the work is a new unit (new agent session, next batch). Large LLM/tool payloads in every step also grow the file — keep stored results small when you can. Use `WithAutoPurge` so finished runs do not pile up.
 - **Step IDs are the resume key — never rename one.** The journal matches records by stepID string only. Renaming a step between deploys orphans the old result: on the next run `fn` executes again under the new name as if it had never run. Treat a stepID like a database column name, not a display label.
 - **Concurrent `RunStep` calls are safe.** Start several steps before `Get`-ing any of them to fan out; join with `Get` or `select` on `Done()`. A duplicate stepID within one run still panics.
 - **One stepID is reserved.** `RunStep` panics if `stepID` is `"\x00cancel"` — it is reserved internally for `CancelRun`'s durable signal. Any human-readable stepID you would actually choose is unaffected.
@@ -212,7 +213,7 @@ Runnable examples in [examples/](examples/) — see [examples/README.md](example
 
 | Example | What it shows |
 |---------|----------------|
-| [`examples/resume/`](examples/resume/) | Crash after step 2, resume from cache |
+| [`examples/resume/`](examples/resume/) | One `go run`: crash after step 2, resume from cache |
 | [`examples/func-task/`](examples/func-task/) | Closure-style `durable.Func` |
 | [`examples/struct-task/`](examples/struct-task/) | Struct task with injected deps, retries, timeout |
 | [`examples/fanout/`](examples/fanout/) | Concurrent `RunStep`, `Get`-all join, `ErrStepPending` |

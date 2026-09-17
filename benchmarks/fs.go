@@ -112,5 +112,17 @@ func writeFileAtomic(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return nil
+	return syncDir(filepath.Dir(path))
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }

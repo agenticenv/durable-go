@@ -1,36 +1,33 @@
 # Resume Example — Crash Recovery
 
-The core durable-go demo. Shows that completed steps are **never re-executed** after a crash.
+One `go run` proves crash recovery: persist two steps, exit without `Close`, reopen the same journal. Completed steps are not re-executed.
 
 ## Run
 
-```bash
-# Run 1 — crashes intentionally after step 2
-CRASH_AFTER=2 go run .
+From the repo root, or from this directory:
 
-# Run 2 — resumes; steps 1 & 2 replayed from cache, only step 3 executes
-go run .
+```bash
+go run ./examples/resume/
+# or: go run .
 ```
 
 ## Expected output
 
-**Run 1**
 ```
-  → [fetch-data]       querying database …  ✓
-  → [run-computation]  running model …      ✓
-💥  SIMULATED CRASH after step 2
+── RUN 1 — persist steps 1–2, then crash ──
+  → [fetch-data] executed
+  ✓ [fetch-data] persisted
+  → [run-computation] executed
+  ✓ [run-computation] persisted
+💥  simulated crash (COMPLETED is on disk; step 3 never ran)
+
+── RUN 2 — new Engine, same dir ──
+  · [fetch-data] replayed (fn not called)
+  · [run-computation] replayed (fn not called)
+  → [deliver-report] executed
+  ✓ [deliver-report] persisted
+
+✅  delivered=true
 ```
 
-**Run 2**
-```
-  → [deliver-report]   sending report …     ✓
-✅  Report delivered: true
-```
-
-On run 2, `fetch-data` and `run-computation` return from the journal without calling the step functions.
-
-## Reset
-
-```bash
-rm -rf examples/resume/.data/
-```
+The crash happens **after** `Get` returns, so steps 1–2 are already in the journal. A crash *inside* a step function re-runs that step (at-least-once), same as a Temporal activity.

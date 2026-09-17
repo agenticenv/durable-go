@@ -85,7 +85,7 @@ func writeReport(w io.Writer, cfg config, disk string, plain, first, replay stat
 	fmt.Fprintf(w, "Filesystem (isolated, same disk — not engine instrumentation)\n")
 	fmt.Fprintf(w, "  journal append+sync  %4d ops  %10s   (2 per step: STARTED + COMPLETED)\n",
 		fs.appendOps, formatDur(fs.appendTotal))
-	fmt.Fprintf(w, "  atomic write         %4d ops  %10s   (tmp+sync+rename; meta/input/output)\n",
+	fmt.Fprintf(w, "  atomic write         %4d ops  %10s   (tmp+sync+rename+dirsync; meta/input/output)\n",
 		fs.atomicOps, formatDur(fs.atomicTotal))
 	if fs.journalReadErr != "" {
 		fmt.Fprintf(w, "  journal read                %10s   (%s)\n", "n/a", fs.journalReadErr)

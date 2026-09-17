@@ -103,7 +103,7 @@ func benchmarkJournalLoad(b *testing.B, steps int) {
 	}
 }
 
-// BenchmarkWriteFileAtomic times tmp+sync+rename (meta/input/output).
+// BenchmarkWriteFileAtomic times tmp+sync+rename+dirsync (meta/input/output).
 func BenchmarkWriteFileAtomic(b *testing.B) {
 	dir := b.TempDir()
 	path := metaPath(dir, benchTaskID, benchRunID)

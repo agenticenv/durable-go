@@ -368,6 +368,93 @@ func TestWriteFileAtomic_ReplacesAndCleansTmp(t *testing.T) {
 	}
 }
 
+func TestSyncDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := syncDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncDir(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("expected error for missing dir")
+	}
+}
+
+func TestGetOrOpenJournal_CreatesJournal(t *testing.T) {
+	dir := t.TempDir()
+	e := &Engine{dataDir: dir}
+	h, err := e.getOrOpenJournal("t1", "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.count != 0 || h.size != 0 {
+		t.Fatalf("new journal count=%d size=%d", h.count, h.size)
+	}
+	path := journalPath(dir, "t1", "r1")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("journal.log missing after create: %v", err)
+	}
+	e.closeJournal("t1", "r1")
+}
+
+func withSyncDirFn(t *testing.T, fn func(string) error) {
+	t.Helper()
+	orig := syncDirFn
+	syncDirFn = fn
+	t.Cleanup(func() { syncDirFn = orig })
+}
+
+func TestWriteFileAtomic_SyncsParentDir(t *testing.T) {
+	dir := t.TempDir()
+	var synced []string
+	withSyncDirFn(t, func(d string) error {
+		synced = append(synced, d)
+		return syncDir(d)
+	})
+
+	path := filepath.Join(dir, "tasks", "t", "r", "meta.json")
+	if err := writeFileAtomic(path, []byte(`{"a":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 1 || synced[0] != filepath.Dir(path) {
+		t.Fatalf("synced %v, want parent of %s", synced, path)
+	}
+}
+
+func TestWriteFileAtomic_DirSyncError(t *testing.T) {
+	withSyncDirFn(t, func(string) error {
+		return errors.New("dir sync failed")
+	})
+	path := filepath.Join(t.TempDir(), "meta.json")
+	if err := writeFileAtomic(path, []byte(`{}`)); err == nil {
+		t.Fatal("expected dir sync error")
+	}
+}
+
+func TestGetOrOpenJournal_SyncsDirOnCreateOnly(t *testing.T) {
+	dir := t.TempDir()
+	var n int
+	withSyncDirFn(t, func(d string) error {
+		n++
+		return syncDir(d)
+	})
+
+	e := &Engine{dataDir: dir}
+	if _, err := e.getOrOpenJournal("t1", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("create dirsync count=%d, want 1", n)
+	}
+	e.closeJournal("t1", "r1")
+
+	if _, err := e.getOrOpenJournal("t1", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("reopen dirsync count=%d, want 1", n)
+	}
+	e.closeJournal("t1", "r1")
+}
+
 func TestScanRuns_SortedAscending(t *testing.T) {
 	dir := t.TempDir()
 	taskID := "task"

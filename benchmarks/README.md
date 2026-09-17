@@ -40,7 +40,7 @@ Same N-step loop, three ways:
 Filesystem probe (same disk, isolated — not engine hooks):
 
 - journal **append+sync** (2× steps, matching STARTED + COMPLETED)
-- **atomic write** (tmp+sync+rename, same pattern as meta/input/output)
+- **atomic write** (tmp+sync+rename+dirsync, same pattern as meta/input/output)
 - **journal read** of the `journal.log` produced by the last first-run
 
 Bump `-steps` and `-payload` to see how latency grows.

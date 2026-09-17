@@ -152,11 +152,14 @@ func resolveRunInput(dataDir, taskID, runID string, caller []byte) ([]byte, erro
 	return caller, nil
 }
 
-// writeFileAtomic persists data via tmp+sync+rename so a crash mid-write
-// leaves either the previous file or the new one — never a half-written
-// meta.json, input.json, or output.json.
+// writeFileAtomic persists data via tmp+sync+rename+dirsync so a crash
+// mid-write leaves either the previous file or the new one — never a
+// half-written meta.json, input.json, or output.json. The parent
+// directory is synced after rename so the directory entry survives
+// power loss.
 func writeFileAtomic(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
@@ -182,7 +185,26 @@ func writeFileAtomic(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return nil
+	return syncDirFn(dir)
+}
+
+// syncDirFn is the directory fsync used after rename and after first
+// journal.log create. Tests swap it to assert those calls.
+var syncDirFn = syncDir
+
+// syncDir fsyncs a directory so a preceding create or rename is durable
+// across power loss. File-only Sync is not enough: the directory entry
+// can still be in the page cache.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func (e *Engine) appendStep(taskID, runID string, step StepRecord) error {
@@ -258,7 +280,13 @@ func (e *Engine) getOrOpenJournal(taskID, runID string) (*journalFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("scan journal tail: %w", err)
 	}
-	f, err := os.OpenFile(e.journalPath(taskID, runID), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	path := e.journalPath(taskID, runID)
+	_, statErr := os.Stat(path)
+	created := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !created {
+		return nil, fmt.Errorf("stat journal: %w", statErr)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open journal: %w", err)
 	}
@@ -267,6 +295,13 @@ func (e *Engine) getOrOpenJournal(taskID, runID string) (*journalFile, error) {
 	if loaded {
 		_ = f.Close()
 		return actual.(*journalFile), nil
+	}
+	if created {
+		if err := syncDirFn(filepath.Dir(path)); err != nil {
+			e.openFiles.Delete(key)
+			_ = f.Close()
+			return nil, fmt.Errorf("sync journal dir: %w", err)
+		}
 	}
 	return h, nil
 }

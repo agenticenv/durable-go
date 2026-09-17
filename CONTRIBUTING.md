@@ -129,7 +129,7 @@ From the repo root:
 go run ./examples/<name>/
 ```
 
-See [examples/README.md](examples/README.md) for the full list. Journal store data is written under `examples/<name>/.data/` (gitignored).
+See [examples/README.md](examples/README.md) for the full list. Journal store data is written under `examples/<name>/.data/` (gitignored). `examples/resume/` uses a temp dir and prints the path.
 
 Inspect a journal after the writer has closed (or on a copy):
 
