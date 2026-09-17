@@ -476,7 +476,7 @@ func TestRunTask_FailedReturnsError(t *testing.T) {
 }
 
 func TestOptionResolution_RunOverridesEngine(t *testing.T) {
-	e := newTestEngine(t, durable.WithMaxRetries(3), durable.WithLogger(slog.Default()))
+	e := newTestEngine(t, durable.WithMaxRetries(3))
 	var n atomic.Int32
 	if err := durable.RegisterTask(e, "opt", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		n.Add(1)

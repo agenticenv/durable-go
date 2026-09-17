@@ -251,12 +251,27 @@ Match this table to your app. If your work is one process plus a local journal, 
 | **Provisioning / install scripts** | Sequence create/configure/verify as steps so a failed run does not recreate what already succeeded. |
 | **Single-process service** (orders, payments, reports) | Charge, ship, notify as memoized steps; wait on manager approval or a webhook without blocking sibling work; race multiple providers with first-of-N. |
 
+## Performance
+
+Persistence is a local `journal.log` append plus `fsync` — no extra server. On a MacBook Pro (M2 Pro, Apple NVMe SSD) that is ~4 ms per append, well under **1%** of a typical LLM call (~1 s). Replay is a file read; `fn` does not run again.
+
+| Operation | Latency | Memory / op | Allocations |
+| :--- | :--- | :--- | :--- |
+| Journal append+sync | `4.1 ms/op` | `328 B/op` | `7 allocs/op` |
+| Journal replay (100 steps) | `272 µs/op` | `269 KB/op` | `919 allocs/op` |
+| Completed-run recovery | `33 µs/op` | `3.6 KB/op` | `31 allocs/op` |
+
+HDD/NFS will differ. Two ways to measure (not the same command):
+
+1. **Your disk, with vs without the engine** — start here: `go run ./benchmarks/` — [`benchmarks/README.md`](benchmarks/README.md)
+2. **Per-op `ns/op` (this table)** — `go test -run=^$ -bench=. -benchmem .` — [`journal_bench_test.go`](journal_bench_test.go)
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, workflow, and guidelines.
 Project policies: [SECURITY.md](SECURITY.md) · [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
-Quick commands (requires [Task](https://taskfile.dev)): `task check` | `task test` | `task lint` | `task fmt` | `task tidy` | `task test-coverage`
+Quick commands (requires [Task](https://taskfile.dev)): `task check` | `task test` | `task lint` | `task fmt` | `task tidy` | `task test-coverage` | `task bench` | `task bench-test`
 
 Coverage reports (PR and default branch) are on **[Codecov](https://app.codecov.io/gh/agenticenv/durable-go)**. Run `task test-coverage` locally to produce `coverage.out` and `coverage.html`.
 

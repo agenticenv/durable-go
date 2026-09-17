@@ -12,4 +12,5 @@ coverage:
 # Paths excluded from coverage reports.
 ignore:
   - "examples/**"
+  - "benchmarks/**"
   - "**/*_test.go"

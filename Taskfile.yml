@@ -33,6 +33,16 @@ tasks:
       - go build -o bin/durable-inspect ./cmd/durable-inspect
       - echo "==> Build complete (bin/durable-inspect)"
 
+  bench:
+    desc: Measure durability overhead (journal persist vs replay vs no engine)
+    cmds:
+      - go run ./benchmarks/ -- {{.CLI_ARGS}}
+
+  bench-test:
+    desc: Run testing.B microbenchmarks (journal append/load, RunTask)
+    cmds:
+      - go test -run=^$ -bench=. -benchmem -count=1 ./...
+
   # ── Test ──────────────────────────────────────────────────────────────────
 
   test:
@@ -48,7 +58,7 @@ tasks:
       GOTOOLCHAIN: '{{.GOTOOLCHAIN_COVERAGE}}'
     cmds:
       - echo "==> Running tests with coverage..."
-      - go test $(go list ./... | grep -v '/examples/') -count=1 -coverprofile=coverage.out
+      - go test $(go list ./... | grep -v '/examples/' | grep -v '/benchmarks/') -count=1 -coverprofile=coverage.out
       - echo "==> Total coverage:"
       - go tool cover -func=coverage.out | grep '^total:'
       - go tool cover -html=coverage.out -o coverage.html

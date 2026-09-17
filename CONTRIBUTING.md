@@ -137,6 +137,27 @@ Inspect a journal after the writer has closed (or on a copy):
 go run ./cmd/durable-inspect -d examples/<name>/.data/<journal> task list
 ```
 
+### 7. Durability benchmark runner
+
+Measures journal persist vs replay vs no engine on the local disk. From the repo root:
+
+```bash
+go run ./benchmarks/ --
+go run ./benchmarks/ -- -steps 100 -payload 64kb
+task bench -- -steps 100
+```
+
+See [benchmarks/README.md](benchmarks/README.md).
+
+### 8. Journal microbenchmarks
+
+`journal_bench_test.go` at the repo root (`go test -bench`, not the runner). Numbers and table: [README — Performance](README.md#performance).
+
+```bash
+go test -run=^$ -bench=. -benchmem ./...
+task bench-test
+```
+
 ## Ways to Contribute
 
 ### Propose a feature
