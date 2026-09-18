@@ -38,8 +38,13 @@ var (
 	ErrStepPending = errors.New("durable: step pending external completion")
 
 	// ErrInvalidToken is returned by CompleteStep when the token cannot be
-	// decoded into taskID, runID, and stepID.
+	// decoded into taskID, runID, and stepID, or when an HMAC token has a
+	// missing or wrong MAC (including unsigned tokens while a secret is set).
 	ErrInvalidToken = errors.New("durable: invalid step token")
+
+	// ErrTokenExpired is returned by CompleteStep when an HMAC step token is
+	// past its TTL.
+	ErrTokenExpired = errors.New("durable: step token expired")
 
 	// ErrRunCancelled is the error stored on a run (TaskInfo.Error, as its
 	// string form) and returned by RunStep/Get after CancelRun. It marks

@@ -15,20 +15,40 @@ import (
 // Names: BenchmarkJournalAppend, BenchmarkJournalAppend1KiB,
 // BenchmarkJournalLoad, BenchmarkJournalLoad100, BenchmarkWriteFileAtomic,
 // BenchmarkRunTaskFirst, BenchmarkRunTaskCompletedGet, BenchmarkStepFnNoEngine.
+// AES-GCM + journal MAC (same three ops as the README default table):
+// BenchmarkJournalAppendAESGCM, BenchmarkJournalLoad100AESGCM,
+// BenchmarkRunTaskCompletedGetAESGCM.
 
 const (
 	benchTaskID = "bench-task"
 	benchRunID  = "bench-run"
 )
 
-func newBenchEngine(b *testing.B) *Engine {
+func newBenchEngine(b *testing.B, opts ...Option) *Engine {
 	b.Helper()
-	e, err := NewEngine(context.Background(), b.TempDir())
+	// No opts: identity codec, CRC32 frames, unsigned sidecars.
+	e, err := NewEngine(context.Background(), b.TempDir(), opts...)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = e.Close() })
 	return e
+}
+
+// benchAESGCMOpts is NewAESGCMCodec (AES-256) plus WithJournalMACKey.
+func benchAESGCMOpts(b *testing.B) []Option {
+	b.Helper()
+	payloadKey := make([]byte, 32)
+	macKey := make([]byte, 32)
+	for i := range payloadKey {
+		payloadKey[i] = byte(i + 1)
+		macKey[i] = byte(0xA0 + i)
+	}
+	codec, err := NewAESGCMCodec(payloadKey)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return []Option{WithPayloadCodec(codec), WithJournalMACKey(macKey)}
 }
 
 func completedRecord(stepID string, payload []byte) StepRecord {
@@ -62,8 +82,13 @@ func BenchmarkJournalAppend1KiB(b *testing.B) {
 	benchmarkJournalAppend(b, payload)
 }
 
-func benchmarkJournalAppend(b *testing.B, payload []byte) {
-	e := newBenchEngine(b)
+// BenchmarkJournalAppendAESGCM is BenchmarkJournalAppend with AES-GCM + journal MAC.
+func BenchmarkJournalAppendAESGCM(b *testing.B) {
+	benchmarkJournalAppend(b, []byte(`"ok"`), benchAESGCMOpts(b)...)
+}
+
+func benchmarkJournalAppend(b *testing.B, payload []byte, opts ...Option) {
+	e := newBenchEngine(b, opts...)
 	if err := e.appendStep(benchTaskID, benchRunID, completedRecord("warm", payload)); err != nil {
 		b.Fatal(err)
 	}
@@ -87,8 +112,13 @@ func BenchmarkJournalLoad100(b *testing.B) {
 	benchmarkJournalLoad(b, 100)
 }
 
-func benchmarkJournalLoad(b *testing.B, steps int) {
-	e := newBenchEngine(b)
+// BenchmarkJournalLoad100AESGCM is BenchmarkJournalLoad100 with AES-GCM + journal MAC.
+func BenchmarkJournalLoad100AESGCM(b *testing.B) {
+	benchmarkJournalLoad(b, 100, benchAESGCMOpts(b)...)
+}
+
+func benchmarkJournalLoad(b *testing.B, steps int, opts ...Option) {
+	e := newBenchEngine(b, opts...)
 	payload := make([]byte, 1024)
 	for i := range payload {
 		payload[i] = 'x'
@@ -143,8 +173,17 @@ func BenchmarkRunTaskFirst(b *testing.B) {
 
 // BenchmarkRunTaskCompletedGet times RunTask on an already-completed run (output.json).
 func BenchmarkRunTaskCompletedGet(b *testing.B) {
+	benchmarkRunTaskCompletedGet(b)
+}
+
+// BenchmarkRunTaskCompletedGetAESGCM is BenchmarkRunTaskCompletedGet with AES-GCM + journal MAC.
+func BenchmarkRunTaskCompletedGetAESGCM(b *testing.B) {
+	benchmarkRunTaskCompletedGet(b, benchAESGCMOpts(b)...)
+}
+
+func benchmarkRunTaskCompletedGet(b *testing.B, opts ...Option) {
 	ctx := context.Background()
-	e := newBenchEngine(b)
+	e := newBenchEngine(b, opts...)
 	if err := RegisterTask(e, benchTaskID, Func(func(ctx context.Context, s *StepRunner, in string) (string, error) {
 		return RunStep(ctx, s, "s", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
 			return in, nil

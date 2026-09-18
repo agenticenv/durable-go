@@ -880,6 +880,56 @@ func TestCompleteStep_TokenWithColonInStepID(t *testing.T) {
 	}
 }
 
+func TestCompleteStep_HMACToken(t *testing.T) {
+	e := newTestEngine(t, durable.WithStepTokenKey([]byte("secret")))
+	var token string
+	if err := durable.RegisterTask(e, "approve", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
+			token = s.StepToken(ctx)
+			return "", durable.ErrStepPending
+		}).Get(ctx)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](context.Background(), e, "approve", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting && token != "" })
+	if !strings.HasPrefix(token, "v1.") {
+		t.Fatalf("expected HMAC token, got %s", token)
+	}
+	if err := durable.CompleteStep(context.Background(), e, encodeTestToken("approve", "r1", "wait"), "nope"); !errors.Is(err, durable.ErrInvalidToken) {
+		t.Fatalf("unsigned token: %v", err)
+	}
+	if err := durable.CompleteStep(context.Background(), e, token, "yes"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run.Get(context.Background())
+	if err != nil || out != "yes" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+func TestCompleteStep_StepTokenTTLOverride(t *testing.T) {
+	e := newTestEngine(t, durable.WithStepTokenKey([]byte("secret")), durable.WithDefaultStepTokenTTL(time.Hour))
+	var token string
+	if err := durable.RegisterTask(e, "approve", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
+			token = s.StepToken(ctx)
+			return "", durable.ErrStepPending
+		}, durable.WithStepTokenTTL(7*24*time.Hour)).Get(ctx)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](context.Background(), e, "approve", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return token != "" })
+	if err := durable.CompleteStep(context.Background(), e, token, "yes"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run.Get(context.Background())
+	if err != nil || out != "yes" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
 func runUntilWaiting(t *testing.T, dir, ver string, n *atomic.Int32) *durable.Engine {
 	t.Helper()
 	e, err := durable.NewEngine(context.Background(), dir)

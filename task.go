@@ -632,7 +632,7 @@ func invokeTask(ctx context.Context, s *StepRunner, entry taskEntry, input []byt
 // Pass explicit statuses to filter, e.g. ListTasks(ctx, StatusRunning,
 // StatusWaiting) for recovery after a restart.
 func (e *Engine) ListTasks(ctx context.Context, statuses ...TaskStatus) ([]TaskInfo, error) {
-	return listTasks(ctx, e.dataDir, statuses...)
+	return listTasks(ctx, e.dataDir, e.journalMACKey(), statuses...)
 }
 
 // GetTask returns a single run's metadata. (zero, false, nil) if not found.
@@ -646,7 +646,7 @@ func (e *Engine) GetTask(ctx context.Context, taskID, runID string) (TaskInfo, b
 	if err := validateRunID(runID); err != nil {
 		return TaskInfo{}, false, err
 	}
-	return loadMeta(e.dataDir, taskID, runID)
+	return loadMeta(e.dataDir, taskID, runID, e.journalMACKey())
 }
 
 // LoadInput returns the JSON-encoded task input written on first RunTask
@@ -661,7 +661,7 @@ func (e *Engine) LoadInput(ctx context.Context, taskID, runID string) ([]byte, b
 	if err := validateRunID(runID); err != nil {
 		return nil, false, err
 	}
-	return loadInput(e.dataDir, taskID, runID)
+	return loadInput(e.dataDir, taskID, runID, e.codec(), e.journalMACKey())
 }
 
 // LoadSteps returns all StepRecords for a run. Used to inspect progress.
@@ -678,7 +678,7 @@ func (e *Engine) LoadSteps(ctx context.Context, taskID, runID string) ([]StepRec
 	if err := validateRunID(runID); err != nil {
 		return nil, err
 	}
-	return loadStepRecords(e.dataDir, taskID, runID)
+	return loadStepRecords(e.dataDir, taskID, runID, e.codec(), e.journalMACKey())
 }
 
 // GetStep returns the latest StepRecord for one stepID in O(1) after one
@@ -721,7 +721,7 @@ func (r *ReadOnlyEngine) GetStep(ctx context.Context, taskID, runID, stepID stri
 	if stepID == "" {
 		return StepRecord{}, false, fmt.Errorf("durable: step ID must not be empty")
 	}
-	steps, _, err := loadJournal(r.dataDir, taskID, runID)
+	steps, _, err := loadJournal(r.dataDir, taskID, runID, r.codec(), r.journalMACKey())
 	if err != nil {
 		return StepRecord{}, false, err
 	}
@@ -967,7 +967,7 @@ func (e *Engine) DeleteTask(ctx context.Context, taskID string) error {
 	return nil
 }
 
-func listTasks(ctx context.Context, dataDir string, statuses ...TaskStatus) ([]TaskInfo, error) {
+func listTasks(ctx context.Context, dataDir string, macKey []byte, statuses ...TaskStatus) ([]TaskInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -998,8 +998,14 @@ func listTasks(ctx context.Context, dataDir string, statuses ...TaskStatus) ([]T
 			return nil, err
 		}
 		for _, runID := range runs {
-			info, ok, err := loadMeta(dataDir, taskID, runID)
-			if err != nil || !ok {
+			info, ok, err := loadMeta(dataDir, taskID, runID, macKey)
+			if err != nil {
+				if len(macKey) > 0 {
+					return nil, err
+				}
+				continue
+			}
+			if !ok {
 				continue
 			}
 			if len(want) > 0 {
@@ -1025,7 +1031,7 @@ func listTasks(ctx context.Context, dataDir string, statuses ...TaskStatus) ([]T
 
 // ListTasks returns TaskInfo records with the same filter semantics as Engine.ListTasks.
 func (r *ReadOnlyEngine) ListTasks(ctx context.Context, statuses ...TaskStatus) ([]TaskInfo, error) {
-	return listTasks(ctx, r.dataDir, statuses...)
+	return listTasks(ctx, r.dataDir, r.journalMACKey(), statuses...)
 }
 
 // GetTask returns a single run's metadata. (zero, false, nil) if not found.
@@ -1039,7 +1045,7 @@ func (r *ReadOnlyEngine) GetTask(ctx context.Context, taskID, runID string) (Tas
 	if err := validateRunID(runID); err != nil {
 		return TaskInfo{}, false, err
 	}
-	return loadMeta(r.dataDir, taskID, runID)
+	return loadMeta(r.dataDir, taskID, runID, r.journalMACKey())
 }
 
 // LoadInput returns the JSON-encoded task input written on first RunTask
@@ -1054,7 +1060,7 @@ func (r *ReadOnlyEngine) LoadInput(ctx context.Context, taskID, runID string) ([
 	if err := validateRunID(runID); err != nil {
 		return nil, false, err
 	}
-	return loadInput(r.dataDir, taskID, runID)
+	return loadInput(r.dataDir, taskID, runID, r.codec(), r.journalMACKey())
 }
 
 // LoadSteps returns all StepRecords for a run ordered by Seq.
@@ -1068,11 +1074,11 @@ func (r *ReadOnlyEngine) LoadSteps(ctx context.Context, taskID, runID string) ([
 	if err := validateRunID(runID); err != nil {
 		return nil, err
 	}
-	return loadStepRecords(r.dataDir, taskID, runID)
+	return loadStepRecords(r.dataDir, taskID, runID, r.codec(), r.journalMACKey())
 }
 
-func loadStepRecords(dataDir, taskID, runID string) ([]StepRecord, error) {
-	steps, _, err := loadJournal(dataDir, taskID, runID)
+func loadStepRecords(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) ([]StepRecord, error) {
+	steps, _, err := loadJournal(dataDir, taskID, runID, c, macKey)
 	if err != nil {
 		return nil, err
 	}

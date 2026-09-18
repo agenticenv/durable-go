@@ -33,9 +33,9 @@ func TestMakeReadFrame_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := makeFrame(payload)
+	frame := makeFrame(payload, nil)
 
-	got, size, err := readFrame(bytes.NewReader(frame))
+	got, size, err := readFrame(bytes.NewReader(frame), nil)
 	if err != nil {
 		t.Fatalf("readFrame: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestMakeReadFrame_RoundTrip(t *testing.T) {
 }
 
 func TestReadFrame_EOFAtEnd(t *testing.T) {
-	_, _, err := readFrame(bytes.NewReader(nil))
+	_, _, err := readFrame(bytes.NewReader(nil), nil)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("empty reader: got %v, want io.EOF", err)
 	}
@@ -72,10 +72,10 @@ func TestReadFrame_CRCCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := makeFrame(payload)
+	frame := makeFrame(payload, nil)
 	frame[len(frame)-1] ^= 0xff
 
-	_, _, err = readFrame(bytes.NewReader(frame))
+	_, _, err = readFrame(bytes.NewReader(frame), nil)
 	if !errors.Is(err, errCorruptFrame) {
 		t.Fatalf("corrupt CRC: got %v, want errCorruptFrame", err)
 	}
@@ -89,10 +89,10 @@ func TestReadFrame_PartialTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := makeFrame(payload)
+	frame := makeFrame(payload, nil)
 	truncated := frame[:len(frame)/2]
 
-	_, _, err = readFrame(bytes.NewReader(truncated))
+	_, _, err = readFrame(bytes.NewReader(truncated), nil)
 	if !errors.Is(err, errCorruptFrame) && !errors.Is(err, io.EOF) {
 		t.Fatalf("partial tail: got %v, want corrupt or EOF", err)
 	}
@@ -101,7 +101,7 @@ func TestReadFrame_PartialTail(t *testing.T) {
 func TestReadFrame_HugeLengthRejected(t *testing.T) {
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], maxFramePayload+1)
-	_, _, err := readFrame(bytes.NewReader(hdr[:]))
+	_, _, err := readFrame(bytes.NewReader(hdr[:]), nil)
 	if !errors.Is(err, errCorruptFrame) {
 		t.Fatalf("huge length: got %v, want errCorruptFrame", err)
 	}
@@ -129,7 +129,7 @@ func TestLoadJournal_CacheAndSignals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cache, signals, err := loadJournal(dir, taskID, runID)
+	cache, signals, err := loadJournal(dir, taskID, runID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestLoadJournal_RunningStatusExcludedFromCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cache, _, err := loadJournal(dir, taskID, runID)
+	cache, _, err := loadJournal(dir, taskID, runID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestLoadStepEvents_IncludesRunningInOrderWithOffsets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := loadStepEvents(dir, taskID, runID)
+	events, err := loadStepEvents(dir, taskID, runID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestJournalTail_ReflectsExistingFrames(t *testing.T) {
 	}
 	e.closeJournal(taskID, runID)
 
-	count, size, err := journalTail(dir, taskID, runID)
+	count, size, err := journalTail(dir, taskID, runID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestLoadJournal_PartialTailStopsReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cache, _, err := loadJournal(dir, taskID, runID)
+	cache, _, err := loadJournal(dir, taskID, runID, nil, nil)
 	if err != nil {
 		t.Fatalf("partial tail must not fail load: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestCompactJournal_PreservesLatestStepAndAllSignals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	steps, sigs, err := readJournalFrames(dir, taskID, runID)
+	steps, sigs, err := readJournalFrames(dir, taskID, runID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestCompactJournal_DropsRunningEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := loadStepEvents(dir, taskID, runID)
+	events, err := loadStepEvents(dir, taskID, runID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +336,7 @@ func TestCompactJournal_DropsRunningEntries(t *testing.T) {
 
 func TestMakeFrame_CRCMatchesPayload(t *testing.T) {
 	payload := []byte("hello")
-	frame := makeFrame(payload)
+	frame := makeFrame(payload, nil)
 	if int(binary.BigEndian.Uint32(frame[:4])) != len(payload) {
 		t.Fatal("length prefix mismatch")
 	}
@@ -345,6 +345,68 @@ func TestMakeFrame_CRCMatchesPayload(t *testing.T) {
 	if got != want {
 		t.Fatalf("crc %d != %d", got, want)
 	}
+}
+
+func TestMakeReadFrame_HMACRoundTrip(t *testing.T) {
+	key := []byte("journal-mac-key")
+	rec := StepRecord{StepID: "echo", Status: StepStatusCompleted, Result: []byte(`"ok"`)}
+	entry := &durablepb.JournalEntry{
+		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(rec)},
+	}
+	payload, err := proto.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := makeFrame(payload, key)
+	if len(frame) != frameLenSize+len(payload)+frameHMACSize {
+		t.Fatalf("frame len %d", len(frame))
+	}
+	got, size, err := readFrame(bytes.NewReader(frame), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(len(frame)) {
+		t.Fatalf("size %d want %d", size, len(frame))
+	}
+	if got.GetStep().GetStepId() != "echo" {
+		t.Fatalf("step %s", got.GetStep().GetStepId())
+	}
+}
+
+func TestReadFrame_HMACMismatch(t *testing.T) {
+	key := []byte("journal-mac-key")
+	entry := &durablepb.JournalEntry{
+		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(StepRecord{StepID: "a", Status: StepStatusCompleted, Result: []byte(`"ok"`)})},
+	}
+	payload, err := proto.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := makeFrame(payload, key)
+	frame[4] ^= 0xff
+	_, _, err = readFrame(bytes.NewReader(frame), key)
+	if !errors.Is(err, errJournalMAC) {
+		t.Fatalf("got %v, want errJournalMAC", err)
+	}
+
+	_, _, err = readFrame(bytes.NewReader(frame), []byte("other-key"))
+	if !errors.Is(err, errJournalMAC) {
+		t.Fatalf("wrong key: got %v, want errJournalMAC", err)
+	}
+}
+
+func TestWriteFileAtomic_RestrictsMode(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "run", "meta.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(path, []byte(`{"a":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	assertPerm(t, filepath.Dir(path), dirPerm)
+	assertPerm(t, path, filePerm)
 }
 
 func TestWriteFileAtomic_ReplacesAndCleansTmp(t *testing.T) {
@@ -392,6 +454,18 @@ func TestGetOrOpenJournal_CreatesJournal(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("journal.log missing after create: %v", err)
 	}
+	e.closeJournal("t1", "r1")
+}
+
+func TestGetOrOpenJournal_RestrictsMode(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	e := &Engine{dataDir: dir}
+	if _, err := e.getOrOpenJournal("t1", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	assertPerm(t, runDir(dir, "t1", "r1"), dirPerm)
+	assertPerm(t, journalPath(dir, "t1", "r1"), filePerm)
 	e.closeJournal("t1", "r1")
 }
 
@@ -483,17 +557,17 @@ func TestSaveLoadMeta(t *testing.T) {
 		CreatedAt: time.Unix(100, 0).UTC(),
 		UpdatedAt: time.Unix(200, 0).UTC(),
 	}
-	if err := saveMeta(dir, "t", "r", info); err != nil {
+	if err := saveMeta(dir, "t", "r", info, nil); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := loadMeta(dir, "t", "r")
+	got, ok, err := loadMeta(dir, "t", "r", nil)
 	if err != nil || !ok {
 		t.Fatalf("load: ok=%v err=%v", ok, err)
 	}
 	if got.Name != "n" || got.Tags["k"] != "v" || got.Status != StatusRunning {
 		t.Fatalf("got %+v", got)
 	}
-	_, ok, err = loadMeta(dir, "t", "missing")
+	_, ok, err = loadMeta(dir, "t", "missing", nil)
 	if err != nil || ok {
 		t.Fatalf("missing: ok=%v err=%v", ok, err)
 	}
@@ -501,10 +575,10 @@ func TestSaveLoadMeta(t *testing.T) {
 
 func TestSaveLoadOutput(t *testing.T) {
 	dir := t.TempDir()
-	if err := saveOutput(dir, "t", "r", []byte(`{"x":1}`)); err != nil {
+	if err := saveOutput(dir, "t", "r", []byte(`{"x":1}`), nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	got, err := loadOutput(dir, "t", "r")
+	got, err := loadOutput(dir, "t", "r", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,17 +589,17 @@ func TestSaveLoadOutput(t *testing.T) {
 
 func TestSaveLoadInput(t *testing.T) {
 	dir := t.TempDir()
-	if err := saveInput(dir, "t", "r", []byte(`{"goal":"x"}`)); err != nil {
+	if err := saveInput(dir, "t", "r", []byte(`{"goal":"x"}`), nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := loadInput(dir, "t", "r")
+	got, ok, err := loadInput(dir, "t", "r", nil, nil)
 	if err != nil || !ok {
 		t.Fatalf("load: ok=%v err=%v", ok, err)
 	}
 	if string(got) != `{"goal":"x"}` {
 		t.Fatalf("got %s", got)
 	}
-	_, ok, err = loadInput(dir, "t", "missing")
+	_, ok, err = loadInput(dir, "t", "missing", nil, nil)
 	if err != nil || ok {
 		t.Fatalf("missing: ok=%v err=%v", ok, err)
 	}
@@ -533,18 +607,72 @@ func TestSaveLoadInput(t *testing.T) {
 
 func TestResolveRunInput_StoredWins(t *testing.T) {
 	dir := t.TempDir()
-	first, err := resolveRunInput(dir, "t", "r", []byte(`"keep"`))
+	first, err := resolveRunInput(dir, "t", "r", []byte(`"keep"`), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(first) != `"keep"` {
 		t.Fatalf("first %s", first)
 	}
-	second, err := resolveRunInput(dir, "t", "r", []byte(`"ignore"`))
+	second, err := resolveRunInput(dir, "t", "r", []byte(`"ignore"`), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(second) != `"keep"` {
 		t.Fatalf("stored-wins %s", second)
+	}
+}
+
+func TestSidecarMAC_RoundTripAndRejectTamper(t *testing.T) {
+	dir := t.TempDir()
+	key := []byte("sidecar-mac-key")
+	info := TaskInfo{TaskID: "t", RunID: "r", Status: StatusCompleted}
+	if err := saveMeta(dir, "t", "r", info, key); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := loadMeta(dir, "t", "r", key)
+	if err != nil || !ok || got.Status != StatusCompleted {
+		t.Fatalf("meta ok=%v err=%v %+v", ok, err, got)
+	}
+	if _, _, err := loadMeta(dir, "t", "r", []byte("other")); !errors.Is(err, errFileMAC) {
+		t.Fatalf("wrong key: %v", err)
+	}
+
+	p := metaPath(dir, "t", "r")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[0] ^= 0xff
+	if err := os.WriteFile(p, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadMeta(dir, "t", "r", key); !errors.Is(err, errFileMAC) {
+		t.Fatalf("tamper: %v", err)
+	}
+
+	if err := saveOutput(dir, "t", "r", []byte(`"ok"`), nil, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveOutput(dir, "t", "other", []byte(`"ok"`), nil, key); err != nil {
+		t.Fatal(err)
+	}
+	stolen, err := os.ReadFile(outputPath(dir, "t", "other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath(dir, "t", "r"), stolen, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOutput(dir, "t", "r", nil, key); !errors.Is(err, errFileMAC) {
+		t.Fatalf("copied output: %v", err)
+	}
+
+	if err := saveInput(dir, "t", "r", []byte(`"in"`), nil, key); err != nil {
+		t.Fatal(err)
+	}
+	in, ok, err := loadInput(dir, "t", "r", nil, key)
+	if err != nil || !ok || string(in) != `"in"` {
+		t.Fatalf("input %q ok=%v err=%v", in, ok, err)
 	}
 }

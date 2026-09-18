@@ -26,6 +26,7 @@
 - **Panic recovery** — task and step panics are recorded and returned as errors.
 - **Auto-purge** — optional background cleanup of old completed and failed runs.
 - **Flexible execution** — tasks as `durable.Func` closures or structs with `Exec`.
+- **Payload privacy** — optional `PayloadCodec` (built-in AES-GCM); owner-only journal modes; inspect `--redact`.
 
 ## Why durable-go
 
@@ -200,6 +201,7 @@ Also:
 - **Concurrent `RunStep` calls are safe.** Start several steps before `Get`-ing any of them to fan out; join with `Get` or `select` on `Done()`. A duplicate stepID within one run still panics.
 - **One stepID is reserved.** `RunStep` panics if `stepID` is `"\x00cancel"` — it is reserved internally for `CancelRun`'s durable signal. Any human-readable stepID you would actually choose is unaffected.
 - **JSON results** — step and task outputs must be JSON-marshalable. Step input `in` must be too.
+- **No secrets or PII in I/O or errors.** Task input, step `in`, and results are persisted. err.Error() and panic values are stored in the journal (plaintext even with WithPayloadCodec) and may be logged. Pass IDs; load credentials and personal data inside `fn` from env or a secret manager. Enabling a codec or journal MAC later is not a migrate — see [Data privacy](#data-privacy--sensitive-payloads).
 - **One task input** — `I` is a single value, not variadic args. Bundle multiple fields in one struct; a task with no payload uses `struct{}` and `struct{}{}`.
 - **One step input** — `in` is a single value, not variadic args. Bundle multiple fields in one struct. No payload: `struct{}` and `struct{}{}`. Stored for inspect.
 - **Bump step version on the next deploy** — resume returns the cached result if `stepID` is unchanged, even when `fn` or `in` changed. If this step’s **code or params** change and in-flight runs must re-execute it, set `WithStepVersion` to a new string (`"1"` → `"2"`) or rename the stepID (`charge` → `charge-v2`). Same version (or no version) = cache. Side effects on re-run are the caller’s problem (idempotent steps).
@@ -216,6 +218,7 @@ Runnable examples in [examples/](examples/) — see [examples/README.md](example
 | [`examples/struct-task/`](examples/struct-task/) | Struct task with injected deps, retries, timeout |
 | [`examples/fanout/`](examples/fanout/) | Concurrent `RunStep`, `Get`-all join, `ErrStepPending` |
 | [`examples/yaml-task/`](examples/yaml-task/) | YAML file as one task; each YAML step is a `RunStep` |
+| [`examples/payload-codec/`](examples/payload-codec/) | Plaintext vs AES-GCM vs custom codec, HMAC tokens, journal MAC, inspect flags |
 
 ```bash
 # from repo root
@@ -224,11 +227,12 @@ go run ./examples/func-task/
 go run ./examples/struct-task/
 go run ./examples/fanout/
 go run ./examples/yaml-task/
+go run ./examples/payload-codec/
 ```
 
 ## Inspect CLI
 
-`durable-inspect` is a read-only viewer for a journal (`task list` / `task get` / `step list` / `step get`). `--dir` / `-d` wins over `DURABLE_DIR`.
+`durable-inspect` is a read-only viewer for a journal (`task list` / `task get` / `step list` / `step get`). `--dir` / `-d` wins over `DURABLE_DIR`. Set `DURABLE_PAYLOAD_KEY` and `DURABLE_JOURNAL_MAC_KEY` in the environment (do not pass keys on the command line). Hex is tried first for both. `--redact` hides INPUT and RESULT.
 
 ```bash
 go install github.com/agenticenv/durable-go/cmd/durable-inspect@latest
@@ -236,6 +240,61 @@ durable-inspect -d ./data task list
 ```
 
 Commands, flags, lookup by name or ID, and the writer-lock behavior: see **[`cmd/durable-inspect/README.md`](cmd/durable-inspect/README.md)**.
+
+## Data privacy & sensitive payloads
+
+The journal is files on disk. **Default persist is plaintext JSON** (`input.json`, `output.json`, step Input/Result, `CompleteStep` payloads). Do not treat `dataDir` as a secret store.
+
+**Keep secrets out of I/O.** Pass order IDs, user IDs, or blob handles. Fetch credentials and PII inside the step `fn` from the environment or a secret manager.
+
+**Optional at-rest codec.** `WithPayloadCodec` wraps those blobs after JSON marshal. Built-in AES-GCM (16/24/32-byte key; never written under `dataDir`):
+
+```go
+key, err := hex.DecodeString(os.Getenv("DURABLE_PAYLOAD_KEY"))
+codec, err := durable.NewAESGCMCodec(key)
+e, err := durable.NewEngine(ctx, "./data", durable.WithPayloadCodec(codec))
+```
+
+Open the same journal with `WithPayloadCodec` or `durable-inspect --payload-key`. Resume without the matching codec+key fails closed. Inspect without a key prints stored ciphertext; a wrong `--payload-key` fails closed. Any reversible `Encode`/`Decode` works; AAD binds each blob to kind/task/run/step so ciphertext cannot be copied between fields. `--redact` is inspect-only — it is not a codec.
+
+```go
+type kmsCodec struct{ client KMS }
+
+func (c kmsCodec) Encode(plaintext, aad []byte) ([]byte, error) {
+    return c.client.Encrypt(plaintext, aad)
+}
+func (c kmsCodec) Decode(ciphertext, aad []byte) ([]byte, error) {
+    return c.client.Decrypt(ciphertext, aad)
+}
+
+e, err := durable.NewEngine(ctx, "./data", durable.WithPayloadCodec(kmsCodec{client: kms}))
+```
+
+**File modes.** Unix directories are `0700` and files `0600`. `NewEngine` chmods an existing `dataDir` and warns if group/world bits remain. Windows chmod is best-effort; encryption still helps there.
+
+**Step tokens.** `CompleteStep` tokens are unsigned with no expiry unless you set `WithStepTokenKey` (HMAC, default 24h TTL). Override with `WithDefaultStepTokenTTL` or per-step `WithStepTokenTTL`. The key is not stored in `dataDir`.
+
+**Journal MAC.** Default frames end in CRC32 (torn-write detection only). `WithJournalMACKey` replaces that trailer with HMAC-SHA256 and also appends a 32-byte HMAC to `input.json`, `output.json`, and `meta.json` (bound to task/run) so those files cannot be rewritten either. The key is not stored in `dataDir`. Inspect reads `DURABLE_JOURNAL_MAC_KEY` (hex first, else raw). Deleting files is still possible.
+
+**Same `dataDir`, same options.** One directory, one codec, one journal MAC key (or none). Those options apply to every run in that tree. Do not turn them on later against an existing plaintext/CRC directory — resume and inspect fail closed.
+
+To add AES and/or a journal MAC and **keep the old journal**: open a **second** `NewEngine` on a new `dataDir` and send new work there. Finish or cancel in-flight runs on the old engine. Wipe the old tree only if you do not need it.
+
+```go
+plain, err := durable.NewEngine(ctx, "./data-plain")
+secure, err := durable.NewEngine(ctx, "./data-secure",
+    durable.WithPayloadCodec(codec),
+    durable.WithJournalMACKey(macKey),
+)
+```
+
+Inspect: one `-d` per directory; set `DURABLE_PAYLOAD_KEY` / `DURABLE_JOURNAL_MAC_KEY` in the environment (not flags). Walkthrough: [`examples/payload-codec/`](examples/payload-codec/). `WithStepTokenKey` does not change the journal; already-issued unsigned tokens are rejected.
+
+**Inspect.** Set `DURABLE_PAYLOAD_KEY` / `DURABLE_JOURNAL_MAC_KEY` (not flags). `--redact` prints `[redacted]` for INPUT/RESULT even after decrypt. Status, IDs, ERROR, and PANIC stay visible. Details: [`cmd/durable-inspect/README.md`](cmd/durable-inspect/README.md).
+
+**Limits.** Encryption is at rest versus other local users of the machine — not versus this process or root. Step IDs, status, timestamps, `Error`, and `PanicTrace` stay plaintext. Compact copies ciphertext as-is.
+
+Runnable walkthrough: [`examples/payload-codec/`](examples/payload-codec/).
 
 ## Use cases
 
@@ -254,11 +313,21 @@ Match this table to your app. If your work is one process plus a local journal, 
 
 Persistence is a local `journal.log` append plus `fsync` — no extra server. On a MacBook Pro (M2 Pro, Apple NVMe SSD) that is ~4 ms per append, well under **1%** of a typical LLM call (~1 s). Replay is a file read; `fn` does not run again.
 
+These figures are the **default persist path**: plaintext JSON (no `PayloadCodec` / AES-GCM), unsigned `CompleteStep` tokens (no `WithStepTokenKey`), and CRC32 journal frames (no `WithJournalMACKey`).
+
 | Operation | Latency | Memory / op | Allocations |
 | :--- | :--- | :--- | :--- |
 | Journal append+sync | `4.1 ms/op` | `328 B/op` | `7 allocs/op` |
 | Journal replay (100 steps) | `272 µs/op` | `269 KB/op` | `919 allocs/op` |
 | Completed-run recovery | `33 µs/op` | `3.6 KB/op` | `31 allocs/op` |
+
+Same machine and ops with **AES-GCM + journal MAC** (`NewAESGCMCodec` AES-256 and `WithJournalMACKey`). Append stays fsync-bound; replay and Get pay decrypt/MAC CPU and extra allocations. `WithStepTokenKey` is not in this table (`CompleteStep` only).
+
+| Operation | Latency | Memory / op | Allocations |
+| :--- | :--- | :--- | :--- |
+| Journal append+sync | `4.1 ms/op` | `1140 B/op` | `19 allocs/op` |
+| Journal replay (100 steps) | `337 µs/op` | `450 KB/op` | `1919 allocs/op` |
+| Completed-run recovery | `33 µs/op` | `4.9 KB/op` | `57 allocs/op` |
 
 HDD/NFS will differ. Two ways to measure (not the same command):
 
@@ -280,4 +349,4 @@ Coverage reports (PR and default branch) are on **[Codecov](https://app.codecov.
 
 ## Disclaimer
 
-This project is provided "as is" under the Apache License 2.0. You are responsible for how you persist and handle task data, including secrets and personally identifiable information in step outputs. For security issues, follow [SECURITY.md](SECURITY.md).
+This project is provided "as is" under the Apache License 2.0. You are responsible for how you persist and handle task data, including secrets and personally identifiable information in step outputs. See [Data privacy](#data-privacy--sensitive-payloads). For security issues, follow [SECURITY.md](SECURITY.md).

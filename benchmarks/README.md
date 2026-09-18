@@ -4,6 +4,8 @@ This directory is a runner (`go run ./benchmarks/`). It measures what durable-go
 
 The step body is a no-op that returns a byte blob. Work is the journal, not your business logic. Run it on the disk you will actually use — fsync cost is not portable.
 
+The runner uses default `NewEngine`: plaintext JSON (no `PayloadCodec` / AES-GCM), unsigned step tokens (no `WithStepTokenKey`), and CRC32 frames (no `WithJournalMACKey`). Do not treat these numbers as AES or HMAC cost.
+
 ## Run
 
 From the **repo root**:

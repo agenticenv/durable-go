@@ -14,9 +14,16 @@ const usage = `Usage:
   durable-inspect [flags] step get <taskID> <runID> <stepID>
 
 Flags:
-  -d, --dir string   journal data directory (overrides DURABLE_DIR)
+  -d, --dir string         journal data directory (overrides DURABLE_DIR)
+      --payload-key string AES-GCM key: 16/24/32 raw bytes, or hex of that
+                           (overrides DURABLE_PAYLOAD_KEY; prefer the env var)
+      --journal-mac-key string HMAC key: raw bytes, or hex of the key
+                           (overrides DURABLE_JOURNAL_MAC_KEY; prefer the env var)
+      --redact             hide task/step INPUT and RESULT ([redacted])
 
 DURABLE_DIR is used when --dir / -d is omitted.
+Set DURABLE_PAYLOAD_KEY and DURABLE_JOURNAL_MAC_KEY in the environment
+(flags put secrets on the command line). Hex is tried first for both keys.
 STATUS is one of: running, waiting, completed, failed.
 
 The journal is opened read-only. If a writer holds the exclusive lock,
@@ -24,13 +31,19 @@ this command fails — stop that process or inspect a copy.
 `
 
 type parsedArgs struct {
-	dir    string
-	status string
-	help   bool
-	rest   []string
+	dir           string
+	status        string
+	payloadKey    string
+	journalMACKey string
+	redact        bool
+	help          bool
+	rest          []string
 }
 
 func parseArgs(args []string) (parsedArgs, error) {
+	if len(args) > 0 && args[0] == "--" {
+		args = args[1:]
+	}
 	var p parsedArgs
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -47,6 +60,24 @@ func parseArgs(args []string) (parsedArgs, error) {
 			p.dir = strings.TrimPrefix(a, "-d=")
 		case strings.HasPrefix(a, "--dir="):
 			p.dir = strings.TrimPrefix(a, "--dir=")
+		case a == "--payload-key":
+			if i+1 >= len(args) {
+				return p, fmt.Errorf("%s requires a value", a)
+			}
+			i++
+			p.payloadKey = args[i]
+		case strings.HasPrefix(a, "--payload-key="):
+			p.payloadKey = strings.TrimPrefix(a, "--payload-key=")
+		case a == "--journal-mac-key":
+			if i+1 >= len(args) {
+				return p, fmt.Errorf("%s requires a value", a)
+			}
+			i++
+			p.journalMACKey = args[i]
+		case strings.HasPrefix(a, "--journal-mac-key="):
+			p.journalMACKey = strings.TrimPrefix(a, "--journal-mac-key=")
+		case a == "--redact":
+			p.redact = true
 		case a == "--status":
 			if i+1 >= len(args) {
 				return p, fmt.Errorf("--status requires a value")
@@ -77,6 +108,26 @@ func resolveDir(flagDir string, getenv func(string) string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("journal directory required: pass --dir / -d or set DURABLE_DIR")
+}
+
+func resolvePayloadKey(flagKey string, getenv func(string) string) string {
+	if flagKey != "" {
+		return flagKey
+	}
+	if getenv != nil {
+		return getenv("DURABLE_PAYLOAD_KEY")
+	}
+	return ""
+}
+
+func resolveJournalMACKey(flagKey string, getenv func(string) string) string {
+	if flagKey != "" {
+		return flagKey
+	}
+	if getenv != nil {
+		return getenv("DURABLE_JOURNAL_MAC_KEY")
+	}
+	return ""
 }
 
 func parseStatus(s string) (durable.TaskStatus, error) {

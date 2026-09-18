@@ -2,13 +2,11 @@ package durable
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 )
@@ -48,6 +46,7 @@ type stepConfig struct {
 	timeout    *time.Duration
 	maxRetries *int
 	version    string
+	tokenTTL   *time.Duration
 }
 
 // StepOption configures a single RunStep call.
@@ -162,13 +161,14 @@ func (s *StepRunner) Logger() *slog.Logger { return s.logger }
 // stepID. Must be called inside a RunStep function with that function's ctx
 // (the stepID is carried on ctx, not on the StepRunner, so concurrent steps
 // each get their own token). Pass the token to an external caller so they
-// can later call CompleteStep.
+// can later call CompleteStep. With WithStepTokenKey the token is HMAC-signed
+// and may expire (default 24h, or WithDefaultStepTokenTTL / WithStepTokenTTL).
 func (s *StepRunner) StepToken(ctx context.Context) string {
 	stepID := stepIDFromCtx(ctx)
 	if stepID == "" {
 		panic("durable: StepToken must be called inside a RunStep function")
 	}
-	return encodeStepToken(s.taskID, s.runID, stepID)
+	return s.engine.issueStepToken(s.taskID, s.runID, stepID, tokenTTLFromCtx(ctx))
 }
 
 func (s *StepRunner) waitInFlight() {
@@ -341,6 +341,7 @@ func versionMatches(want, stored string) bool {
 func execStep[I, O any](ctx context.Context, s *StepRunner, stepID string, in I, input []byte, fn func(context.Context, I) (O, error), cfg stepConfig, rec StepRecord, has bool) (O, error) {
 	var zero O
 	stepCtx := withStepID(ctx, stepID)
+	stepCtx = withStepTokenTTL(stepCtx, s.engine.effectiveTokenTTL(cfg.tokenTTL))
 	var cancel context.CancelFunc
 	if cfg.timeout != nil && *cfg.timeout > 0 {
 		stepCtx, cancel = context.WithTimeout(stepCtx, *cfg.timeout)
@@ -550,32 +551,13 @@ func (s *StepRunner) setRunStatus(status TaskStatus) error {
 	return nil
 }
 
-// encodeStepToken uses base64.RawURLEncoding of "taskID:runID:stepID".
-// runID is a ULID (no colons); taskID is rejected if it contains ':'.
-// stepID may contain colons because decode uses SplitN(..., 3).
-func encodeStepToken(taskID, runID, stepID string) string {
-	raw := taskID + ":" + runID + ":" + stepID
-	return base64.RawURLEncoding.EncodeToString([]byte(raw))
-}
-
-func decodeStepToken(token string) (taskID, runID, stepID string, err error) {
-	b, err := base64.RawURLEncoding.DecodeString(token)
-	if err != nil {
-		return "", "", "", ErrInvalidToken
-	}
-	parts := strings.SplitN(string(b), ":", 3)
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return "", "", "", ErrInvalidToken
-	}
-	return parts[0], parts[1], parts[2], nil
-}
-
 // CompleteStep delivers result to a suspended step identified by token.
 // The payload is appended as a SignalEntry (durable) before the in-process
 // waiter is signalled, so a crash after this call still resumes on the next
 // RunTask. A second call with the same token is a no-op once the SignalEntry
 // is on disk. Returns ErrRunAlreadyFinished if the step or run is already
-// terminal, and ErrInvalidToken if the token cannot be decoded.
+// terminal, ErrInvalidToken if the token cannot be decoded or authenticated,
+// and ErrTokenExpired if an HMAC token is past its TTL.
 //
 // The run's status transition back to StatusRunning is owned by the waiting
 // step itself (see leaveWaiting), not by CompleteStep — with several steps
@@ -592,7 +574,7 @@ func CompleteStep[O any](ctx context.Context, e *Engine, token string, result O)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	taskID, runID, stepID, err := decodeStepToken(token)
+	taskID, runID, stepID, err := e.decodeStepToken(token)
 	if err != nil {
 		return err
 	}

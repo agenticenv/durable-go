@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 
 	durable "github.com/agenticenv/durable-go"
 )
+
+const redacted = "[redacted]"
 
 func run(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
 	p, err := parseArgs(args)
@@ -57,7 +60,7 @@ func dispatch(p parsedArgs, stdout io.Writer, getenv func(string) string) error 
 	}
 
 	ctx := context.Background()
-	r, err := openRO(dir)
+	r, err := openRO(dir, resolvePayloadKey(p.payloadKey, getenv), resolveJournalMACKey(p.journalMACKey, getenv))
 	if err != nil {
 		return err
 	}
@@ -73,24 +76,39 @@ func dispatch(p parsedArgs, stdout io.Writer, getenv func(string) string) error 
 		if len(ids) == 0 || len(ids) > 2 {
 			return fmt.Errorf("%w: task get <taskID|runID|name> [runID]", errUsage)
 		}
-		return cmdTaskGet(ctx, r, stdout, ids)
+		return cmdTaskGet(ctx, r, stdout, ids, p.redact)
 	case "step list":
 		if len(ids) != 2 {
 			return fmt.Errorf("%w: step list <taskID> <runID>", errUsage)
 		}
-		return cmdStepList(ctx, r, stdout, ids[0], ids[1])
+		return cmdStepList(ctx, r, stdout, ids[0], ids[1], p.redact)
 	case "step get":
 		if len(ids) != 3 {
 			return fmt.Errorf("%w: step get <taskID> <runID> <stepID>", errUsage)
 		}
-		return cmdStepGet(ctx, r, stdout, ids[0], ids[1], ids[2])
+		return cmdStepGet(ctx, r, stdout, ids[0], ids[1], ids[2], p.redact)
 	default:
 		return fmt.Errorf("%w: unknown command %q %q", errUsage, noun, verb)
 	}
 }
 
-func openRO(dir string) (*durable.ReadOnlyEngine, error) {
-	r, err := durable.NewReadOnlyEngine(dir, durable.WithROLockTimeout(500*time.Millisecond))
+func openRO(dir, payloadKey, journalMACKey string) (*durable.ReadOnlyEngine, error) {
+	opts := []durable.Option{durable.WithLockTimeout(500 * time.Millisecond)}
+	if payloadKey != "" {
+		key, err := parseAESKey(payloadKey)
+		if err != nil {
+			return nil, err
+		}
+		codec, err := durable.NewAESGCMCodec(key)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, durable.WithPayloadCodec(codec))
+	}
+	if journalMACKey != "" {
+		opts = append(opts, durable.WithJournalMACKey(parseHMACKey(journalMACKey)))
+	}
+	r, err := durable.NewReadOnlyEngine(dir, opts...)
 	if errors.Is(err, durable.ErrEngineLocked) {
 		return nil, fmt.Errorf("journal %q is locked by a writer; stop that process or inspect a copy", dir)
 	}
@@ -98,6 +116,35 @@ func openRO(dir string) (*durable.ReadOnlyEngine, error) {
 		return nil, err
 	}
 	return r, nil
+}
+
+// parseHMACKey treats even-length hex as the key bytes (same idea as
+// parseAESKey). Otherwise the string is used as raw key bytes. HMAC has
+// no 16/24/32-byte length lock.
+func parseHMACKey(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	if b, err := hex.DecodeString(s); err == nil && len(b) > 0 {
+		return b
+	}
+	return []byte(s)
+}
+
+func parseAESKey(s string) ([]byte, error) {
+	if b, err := hex.DecodeString(s); err == nil {
+		switch len(b) {
+		case 16, 24, 32:
+			return b, nil
+		}
+	}
+	raw := []byte(s)
+	switch len(raw) {
+	case 16, 24, 32:
+		return raw, nil
+	default:
+		return nil, fmt.Errorf("payload key must be 16, 24, or 32 bytes, or hex of that length")
+	}
 }
 
 func cmdTaskList(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, status string) error {
@@ -117,7 +164,7 @@ func cmdTaskList(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, st
 	return nil
 }
 
-func cmdTaskGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, ids []string) error {
+func cmdTaskGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, ids []string, redact bool) error {
 	all, err := r.ListTasks(ctx)
 	if err != nil {
 		return err
@@ -143,7 +190,7 @@ func cmdTaskGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, ids
 			return fmt.Errorf("multiple runs match %q", ids[0])
 		}
 	}
-	return printTaskDetail(ctx, r, w, matches[0])
+	return printTaskDetail(ctx, r, w, matches[0], redact)
 }
 
 func matchRuns(all []durable.TaskInfo, q string) []durable.TaskInfo {
@@ -156,7 +203,7 @@ func matchRuns(all []durable.TaskInfo, q string) []durable.TaskInfo {
 	return out
 }
 
-func cmdStepList(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, taskID, runID string) error {
+func cmdStepList(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, taskID, runID string, redact bool) error {
 	if _, ok, err := r.GetTask(ctx, taskID, runID); err != nil {
 		return err
 	} else if !ok {
@@ -166,11 +213,11 @@ func cmdStepList(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, ta
 	if err != nil {
 		return err
 	}
-	printStepTable(w, steps)
+	printStepTable(w, steps, redact)
 	return nil
 }
 
-func cmdStepGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, taskID, runID, stepID string) error {
+func cmdStepGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, taskID, runID, stepID string, redact bool) error {
 	rec, ok, err := r.GetStep(ctx, taskID, runID, stepID)
 	if err != nil {
 		return err
@@ -184,7 +231,7 @@ func cmdStepGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, tas
 		_, _ = fmt.Fprintf(w, "VERSION:\t%s\n", rec.Version)
 	}
 	if len(rec.Input) > 0 {
-		_, _ = fmt.Fprintf(w, "INPUT:\t%s\n", fmtResult(rec.Input))
+		_, _ = fmt.Fprintf(w, "INPUT:\t%s\n", fmtPayload(rec.Input, redact))
 	}
 	_, _ = fmt.Fprintf(w, "STARTED:\t%s\n", fmtTime(rec.StartedAt))
 	_, _ = fmt.Fprintf(w, "COMPLETED:\t%s\n", fmtTime(rec.CompletedAt))
@@ -195,12 +242,12 @@ func cmdStepGet(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, tas
 		_, _ = fmt.Fprintf(w, "PANIC:\t%s\n", rec.PanicTrace)
 	}
 	if len(rec.Result) > 0 {
-		_, _ = fmt.Fprintf(w, "RESULT:\t%s\n", fmtResult(rec.Result))
+		_, _ = fmt.Fprintf(w, "RESULT:\t%s\n", fmtPayload(rec.Result, redact))
 	}
 	return nil
 }
 
-func printTaskDetail(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, t durable.TaskInfo) error {
+func printTaskDetail(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer, t durable.TaskInfo, redact bool) error {
 	_, _ = fmt.Fprintf(w, "TASK_ID:\t%s\n", t.TaskID)
 	_, _ = fmt.Fprintf(w, "RUN_ID:\t%s\n", t.RunID)
 	_, _ = fmt.Fprintf(w, "NAME:\t%s\n", t.Name)
@@ -219,7 +266,7 @@ func printTaskDetail(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer
 		return err
 	}
 	if ok {
-		_, _ = fmt.Fprintf(w, "INPUT:\t%s\n", fmtResult(in))
+		_, _ = fmt.Fprintf(w, "INPUT:\t%s\n", fmtPayload(in, redact))
 	}
 	steps, err := r.LoadSteps(ctx, t.TaskID, t.RunID)
 	if err != nil {
@@ -229,7 +276,7 @@ func printTaskDetail(ctx context.Context, r *durable.ReadOnlyEngine, w io.Writer
 		return nil
 	}
 	_, _ = fmt.Fprintln(w)
-	printStepTable(w, steps)
+	printStepTable(w, steps, redact)
 	return nil
 }
 
@@ -242,11 +289,11 @@ func printTaskTable(w io.Writer, tasks []durable.TaskInfo) {
 	_ = tw.Flush()
 }
 
-func printStepTable(w io.Writer, steps []durable.StepRecord) {
+func printStepTable(w io.Writer, steps []durable.StepRecord, redact bool) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "STEP_ID\tSTATUS\tVERSION\tINPUT\tSTARTED\tCOMPLETED")
 	for _, s := range steps {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", s.StepID, s.Status, s.Version, fmtResult(s.Input), fmtTime(s.StartedAt), fmtTime(s.CompletedAt))
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", s.StepID, s.Status, s.Version, fmtPayload(s.Input, redact), fmtTime(s.StartedAt), fmtTime(s.CompletedAt))
 	}
 	_ = tw.Flush()
 }
@@ -256,6 +303,13 @@ func fmtTime(t time.Time) string {
 		return "-"
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+func fmtPayload(b []byte, redact bool) string {
+	if redact && len(b) > 0 {
+		return redacted
+	}
+	return fmtResult(b)
 }
 
 func fmtResult(b []byte) string {

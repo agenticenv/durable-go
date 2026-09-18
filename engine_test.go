@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,7 +15,25 @@ import (
 	durable "github.com/agenticenv/durable-go"
 )
 
-func newTestEngine(t *testing.T, opts ...durable.EngineOption) *durable.Engine {
+func skipIfWindows(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("file permission bits are not enforced on Windows")
+	}
+}
+
+func assertPerm(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Mode().Perm(); got != want {
+		t.Fatalf("%s mode %04o, want %04o", path, got, want)
+	}
+}
+
+func newTestEngine(t *testing.T, opts ...durable.Option) *durable.Engine {
 	t.Helper()
 	e, err := durable.NewEngine(context.Background(), t.TempDir(), opts...)
 	if err != nil {
@@ -65,6 +87,74 @@ func TestNewEngine_ReopenAfterClose(t *testing.T) {
 	}
 	if err := e2.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNewEngine_RestrictsDataDirPerms(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e, err := durable.NewEngine(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close() }()
+
+	assertPerm(t, dir, 0o700)
+	assertPerm(t, filepath.Join(dir, "tasks"), 0o700)
+	assertPerm(t, filepath.Join(dir, ".lock"), 0o600)
+}
+
+func TestNewEngine_TightensExistingJournalFiles(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	run := filepath.Join(dir, "tasks", "echo", "run-1")
+	if err := os.MkdirAll(run, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(run, "journal.log")
+	if err := os.WriteFile(journal, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := durable.NewEngine(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close() }()
+
+	assertPerm(t, dir, 0o700)
+	assertPerm(t, filepath.Join(dir, "tasks", "echo"), 0o700)
+	assertPerm(t, run, 0o700)
+	assertPerm(t, journal, 0o600)
+}
+
+func TestRunTask_PersistedFilesAreOwnerOnly(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	e, err := durable.NewEngine(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close() }()
+
+	if err := durable.RegisterTask(e, "echo", identityTask()); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](context.Background(), e, "echo", "run-1", "hello")
+	if _, err := run.Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	runDir := filepath.Join(dir, "tasks", "echo", "run-1")
+	assertPerm(t, runDir, 0o700)
+	for _, name := range []string{"journal.log", "input.json", "output.json", "meta.json"} {
+		assertPerm(t, filepath.Join(runDir, name), 0o600)
 	}
 }
 
@@ -128,7 +218,7 @@ func TestNewEngine_ExclusiveBlocksReadOnly(t *testing.T) {
 	}
 	defer func() { _ = e.Close() }()
 
-	_, err = durable.NewReadOnlyEngine(dir, durable.WithROLockTimeout(200*time.Millisecond))
+	_, err = durable.NewReadOnlyEngine(dir, durable.WithLockTimeout(200*time.Millisecond))
 	if !errors.Is(err, durable.ErrEngineLocked) {
 		t.Fatalf("got %v, want ErrEngineLocked", err)
 	}
@@ -191,7 +281,7 @@ func TestReadOnlyEngine_BlockedWhileWriterHoldsLock(t *testing.T) {
 	}
 	defer func() { _ = e.Close() }()
 
-	_, err = durable.NewReadOnlyEngine(dir, durable.WithROLockTimeout(150*time.Millisecond))
+	_, err = durable.NewReadOnlyEngine(dir, durable.WithLockTimeout(150*time.Millisecond))
 	if !errors.Is(err, durable.ErrEngineLocked) {
 		t.Fatalf("got %v, want ErrEngineLocked", err)
 	}
@@ -503,7 +593,7 @@ func TestCancelRun_Idempotent(t *testing.T) {
 	}
 }
 
-func TestReadOnly_WithROLogger(t *testing.T) {
+func TestReadOnly_WithLogger(t *testing.T) {
 	dir := t.TempDir()
 	e, err := durable.NewEngine(context.Background(), dir)
 	if err != nil {
@@ -512,9 +602,127 @@ func TestReadOnly_WithROLogger(t *testing.T) {
 	if err := e.Close(); err != nil {
 		t.Fatal(err)
 	}
-	r, err := durable.NewReadOnlyEngine(dir, durable.WithROLogger(slog.Default()), durable.WithROLockTimeout(2*time.Second))
+	r, err := durable.NewReadOnlyEngine(dir,
+		durable.WithLogger(slog.Default()),
+		durable.WithLockTimeout(2*time.Second),
+		durable.WithAutoPurge(time.Hour),
+		durable.WithStepTokenKey([]byte("ignored")),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = r.Close() }()
+}
+
+func TestJournalMACKey_ReplayAndRejectTamper(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	macKey := []byte("journal-mac-key")
+	e, err := durable.NewEngine(ctx, dir, durable.WithJournalMACKey(macKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "echo", in, func(_ context.Context, in string) (string, error) {
+			return in, nil
+		}).Get(ctx)
+	})
+	if err := durable.RegisterTask(e, "echo", task); err != nil {
+		t.Fatal(err)
+	}
+	out, err := durable.RunTask[string, string](ctx, e, "echo", "run-1", "hello").Get(ctx)
+	if err != nil || out != "hello" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, err := durable.NewEngine(ctx, dir, durable.WithJournalMACKey(macKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.RegisterTask(e2, "echo", task); err != nil {
+		t.Fatal(err)
+	}
+	out, err = durable.RunTask[string, string](ctx, e2, "echo", "run-1", "ignored").Get(ctx)
+	if err != nil || out != "hello" {
+		t.Fatalf("replay out=%q err=%v", out, err)
+	}
+	if err := e2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	runDir := filepath.Join(dir, "tasks", "echo", "run-1")
+	raw, err := os.ReadFile(filepath.Join(runDir, "journal.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Flip a protobuf byte (not the length prefix). A midpoint XOR can
+	// land on a later frame's length and look like a torn tail, which
+	// scanJournal would skip instead of fail-closed.
+	if len(raw) < 4+1+32 {
+		t.Fatal("journal too small for an HMAC frame")
+	}
+	raw[4] ^= 0xff
+	if err := os.WriteFile(filepath.Join(runDir, "journal.log"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	e3, err := durable.NewEngine(ctx, dir, durable.WithJournalMACKey(macKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e3.Close() }()
+	if _, err := e3.LoadSteps(ctx, "echo", "run-1"); err == nil || !strings.Contains(err.Error(), "journal MAC mismatch") {
+		t.Fatalf("got %v, want journal MAC mismatch", err)
+	}
+}
+
+func TestJournalMACKey_RejectSidecarTamper(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	macKey := []byte("journal-mac-key")
+	e, err := durable.NewEngine(ctx, dir, durable.WithJournalMACKey(macKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "echo", in, func(_ context.Context, in string) (string, error) {
+			return in, nil
+		}).Get(ctx)
+	})
+	if err := durable.RegisterTask(e, "echo", task); err != nil {
+		t.Fatal(err)
+	}
+	out, err := durable.RunTask[string, string](ctx, e, "echo", "run-1", "hello").Get(ctx)
+	if err != nil || out != "hello" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	outPath := filepath.Join(dir, "tasks", "echo", "run-1", "output.json")
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[0] ^= 0xff
+	if err := os.WriteFile(outPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, err := durable.NewEngine(ctx, dir, durable.WithJournalMACKey(macKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e2.Close() }()
+	if err := durable.RegisterTask(e2, "echo", task); err != nil {
+		t.Fatal(err)
+	}
+	_, err = durable.RunTask[string, string](ctx, e2, "echo", "run-1", "ignored").Get(ctx)
+	if err == nil || !strings.Contains(err.Error(), "file MAC mismatch") {
+		t.Fatalf("got %v, want file MAC mismatch", err)
+	}
 }

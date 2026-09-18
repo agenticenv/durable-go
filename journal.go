@@ -1,6 +1,8 @@
 package durable
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -18,18 +20,29 @@ import (
 	durablepb "github.com/agenticenv/durable-go/pb"
 )
 
-// Frame layout: [4B uint32 BE payload length][protobuf JournalEntry][4B CRC32-IEEE].
-// Length-prefixing lets a reader skip unknown future entry types. CRC32 detects
-// a torn write from kill -9 or power loss so replay can stop at the last
-// intact frame instead of treating garbage as data.
+// Frame layout: [4B uint32 BE payload length][protobuf JournalEntry][trailer].
+// Trailer is 4B CRC32-IEEE by default, or 32B HMAC-SHA256 when
+// WithJournalMACKey is set. Length-prefixing lets a reader skip unknown
+// future entry types. CRC32 detects a torn write from kill -9 or power
+// loss so replay can stop at the last intact frame. HMAC also detects
+// that, and rejects an editor who rewrites the protobuf and recomputes CRC32.
 const (
-	frameLenSize    = 4
-	frameCRCSize    = 4
-	frameOverhead   = frameLenSize + frameCRCSize
-	maxFramePayload = 32 << 20 // 32 MiB — reject corrupt lengths that would OOM
+	frameLenSize        = 4
+	frameCRCSize        = 4
+	frameHMACSize       = sha256.Size
+	frameOverhead       = frameLenSize + frameCRCSize // default (CRC) overhead
+	maxFramePayload     = 32 << 20                    // 32 MiB — reject corrupt lengths that would OOM
+	journalMACDomain    = "durable.journal.v1"
+	fileMACDomainMeta   = "durable.meta.v1"
+	fileMACDomainInput  = "durable.input.v1"
+	fileMACDomainOutput = "durable.output.v1"
 )
 
-var errCorruptFrame = errors.New("durable: corrupt or truncated journal frame")
+var (
+	errCorruptFrame = errors.New("durable: corrupt or truncated journal frame")
+	errJournalMAC   = errors.New("durable: journal MAC mismatch")
+	errFileMAC      = errors.New("durable: file MAC mismatch")
+)
 
 // journalFile is a cached append handle. CompleteStep writes SignalEntry
 // without holding runLocks (the waiter already holds that lock), so each
@@ -45,55 +58,60 @@ type journalFile struct {
 }
 
 func (e *Engine) saveMeta(taskID, runID string, info TaskInfo) error {
-	return saveMeta(e.dataDir, taskID, runID, info)
+	return saveMeta(e.dataDir, taskID, runID, info, e.journalMACKey())
 }
 
 func (e *Engine) loadMeta(taskID, runID string) (TaskInfo, bool, error) {
-	return loadMeta(e.dataDir, taskID, runID)
+	return loadMeta(e.dataDir, taskID, runID, e.journalMACKey())
 }
 
 func (e *Engine) saveOutput(taskID, runID string, output []byte) error {
-	return saveOutput(e.dataDir, taskID, runID, output)
+	return saveOutput(e.dataDir, taskID, runID, output, e.codec(), e.journalMACKey())
 }
 
 func (e *Engine) loadOutput(taskID, runID string) ([]byte, error) {
-	return loadOutput(e.dataDir, taskID, runID)
+	return loadOutput(e.dataDir, taskID, runID, e.codec(), e.journalMACKey())
 }
 
 func (e *Engine) resolveRunInput(taskID, runID string, caller []byte) ([]byte, error) {
-	return resolveRunInput(e.dataDir, taskID, runID, caller)
+	return resolveRunInput(e.dataDir, taskID, runID, caller, e.codec(), e.journalMACKey())
 }
 
 func (e *Engine) loadJournal(taskID, runID string) (map[string]StepRecord, map[string][]byte, error) {
-	return loadJournal(e.dataDir, taskID, runID)
+	return loadJournal(e.dataDir, taskID, runID, e.codec(), e.journalMACKey())
 }
 
 func (e *Engine) loadStepEvents(taskID, runID string) ([]StepEvent, error) {
-	return loadStepEvents(e.dataDir, taskID, runID)
+	return loadStepEvents(e.dataDir, taskID, runID, e.codec(), e.journalMACKey())
 }
 
 func (e *Engine) scanRuns(taskID string) ([]string, error) {
 	return scanRuns(e.dataDir, taskID)
 }
 
-func saveMeta(dataDir, taskID, runID string, info TaskInfo) error {
+func saveMeta(dataDir, taskID, runID string, info TaskInfo, macKey []byte) error {
 	raw, err := json.Marshal(info)
 	if err != nil {
 		return fmt.Errorf("durable: marshal meta %s/%s: %w", taskID, runID, err)
 	}
+	raw = wrapSidecarMAC(macKey, fileMACDomainMeta, taskID, runID, raw)
 	if err := writeFileAtomic(metaPath(dataDir, taskID, runID), raw); err != nil {
 		return fmt.Errorf("durable: write meta %s/%s: %w", taskID, runID, err)
 	}
 	return nil
 }
 
-func loadMeta(dataDir, taskID, runID string) (TaskInfo, bool, error) {
+func loadMeta(dataDir, taskID, runID string, macKey []byte) (TaskInfo, bool, error) {
 	raw, err := os.ReadFile(metaPath(dataDir, taskID, runID))
 	if errors.Is(err, os.ErrNotExist) {
 		return TaskInfo{}, false, nil
 	}
 	if err != nil {
 		return TaskInfo{}, false, fmt.Errorf("durable: read meta %s/%s: %w", taskID, runID, err)
+	}
+	raw, err = unwrapSidecarMAC(macKey, fileMACDomainMeta, taskID, runID, raw)
+	if err != nil {
+		return TaskInfo{}, false, fmt.Errorf("durable: verify meta %s/%s: %w", taskID, runID, err)
 	}
 	var info TaskInfo
 	if err := json.Unmarshal(raw, &info); err != nil {
@@ -102,29 +120,43 @@ func loadMeta(dataDir, taskID, runID string) (TaskInfo, bool, error) {
 	return info, true, nil
 }
 
-func saveOutput(dataDir, taskID, runID string, output []byte) error {
-	if err := writeFileAtomic(outputPath(dataDir, taskID, runID), output); err != nil {
+func saveOutput(dataDir, taskID, runID string, output []byte, c PayloadCodec, macKey []byte) error {
+	stored, err := encodePayload(c, output, payloadAAD(aadKindTaskOutput, taskID, runID, ""))
+	if err != nil {
+		return err
+	}
+	stored = wrapSidecarMAC(macKey, fileMACDomainOutput, taskID, runID, stored)
+	if err := writeFileAtomic(outputPath(dataDir, taskID, runID), stored); err != nil {
 		return fmt.Errorf("durable: write output %s/%s: %w", taskID, runID, err)
 	}
 	return nil
 }
 
-func loadOutput(dataDir, taskID, runID string) ([]byte, error) {
+func loadOutput(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) ([]byte, error) {
 	raw, err := os.ReadFile(outputPath(dataDir, taskID, runID))
 	if err != nil {
 		return nil, fmt.Errorf("durable: read output %s/%s: %w", taskID, runID, err)
 	}
-	return raw, nil
+	raw, err = unwrapSidecarMAC(macKey, fileMACDomainOutput, taskID, runID, raw)
+	if err != nil {
+		return nil, fmt.Errorf("durable: verify output %s/%s: %w", taskID, runID, err)
+	}
+	return decodePayload(c, raw, payloadAAD(aadKindTaskOutput, taskID, runID, ""))
 }
 
-func saveInput(dataDir, taskID, runID string, input []byte) error {
-	if err := writeFileAtomic(inputPath(dataDir, taskID, runID), input); err != nil {
+func saveInput(dataDir, taskID, runID string, input []byte, c PayloadCodec, macKey []byte) error {
+	stored, err := encodePayload(c, input, payloadAAD(aadKindTaskInput, taskID, runID, ""))
+	if err != nil {
+		return err
+	}
+	stored = wrapSidecarMAC(macKey, fileMACDomainInput, taskID, runID, stored)
+	if err := writeFileAtomic(inputPath(dataDir, taskID, runID), stored); err != nil {
 		return fmt.Errorf("durable: write input %s/%s: %w", taskID, runID, err)
 	}
 	return nil
 }
 
-func loadInput(dataDir, taskID, runID string) ([]byte, bool, error) {
+func loadInput(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) ([]byte, bool, error) {
 	raw, err := os.ReadFile(inputPath(dataDir, taskID, runID))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -132,21 +164,29 @@ func loadInput(dataDir, taskID, runID string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("durable: read input %s/%s: %w", taskID, runID, err)
 	}
-	return raw, true, nil
+	raw, err = unwrapSidecarMAC(macKey, fileMACDomainInput, taskID, runID, raw)
+	if err != nil {
+		return nil, false, fmt.Errorf("durable: verify input %s/%s: %w", taskID, runID, err)
+	}
+	decoded, err := decodePayload(c, raw, payloadAAD(aadKindTaskInput, taskID, runID, ""))
+	if err != nil {
+		return nil, false, err
+	}
+	return decoded, true, nil
 }
 
 // resolveRunInput returns the stored input when input.json exists (resume).
 // Otherwise it persists caller bytes and returns them (first start, or a
 // pre-v1 run that has no input file).
-func resolveRunInput(dataDir, taskID, runID string, caller []byte) ([]byte, error) {
-	stored, ok, err := loadInput(dataDir, taskID, runID)
+func resolveRunInput(dataDir, taskID, runID string, caller []byte, c PayloadCodec, macKey []byte) ([]byte, error) {
+	stored, ok, err := loadInput(dataDir, taskID, runID, c, macKey)
 	if err != nil {
 		return nil, err
 	}
 	if ok {
 		return stored, nil
 	}
-	if err := saveInput(dataDir, taskID, runID, caller); err != nil {
+	if err := saveInput(dataDir, taskID, runID, caller, c, macKey); err != nil {
 		return nil, err
 	}
 	return caller, nil
@@ -159,11 +199,11 @@ func resolveRunInput(dataDir, taskID, runID string, caller []byte) ([]byte, erro
 // power loss.
 func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := mkdirAllSecure(dir); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := openFileSecure(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return err
 	}
@@ -185,6 +225,7 @@ func writeFileAtomic(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	chmodBestEffort(path, filePerm)
 	return syncDirFn(dir)
 }
 
@@ -208,8 +249,12 @@ func syncDir(dir string) error {
 }
 
 func (e *Engine) appendStep(taskID, runID string, step StepRecord) error {
+	stored, err := encodeStepRecord(e.codec(), taskID, runID, step)
+	if err != nil {
+		return fmt.Errorf("durable: append step %s/%s/%s: %w", taskID, runID, step.StepID, err)
+	}
 	entry := &durablepb.JournalEntry{
-		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(step)},
+		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(stored)},
 	}
 	offset, byteOffset, err := e.appendFrame(taskID, runID, entry)
 	if err != nil {
@@ -220,11 +265,15 @@ func (e *Engine) appendStep(taskID, runID string, step StepRecord) error {
 }
 
 func (e *Engine) appendSignal(taskID, runID, stepID string, payload []byte) error {
+	stored, err := encodePayload(e.codec(), payload, payloadAAD(aadKindSignal, taskID, runID, stepID))
+	if err != nil {
+		return fmt.Errorf("durable: append signal %s/%s/%s: %w", taskID, runID, stepID, err)
+	}
 	entry := &durablepb.JournalEntry{
 		Entry: &durablepb.JournalEntry_Signal{
 			Signal: &durablepb.SignalEntry{
 				SignalId: stepID,
-				Payload:  payload,
+				Payload:  stored,
 				SentAtNs: time.Now().UTC().UnixNano(),
 			},
 		},
@@ -244,7 +293,7 @@ func (e *Engine) appendFrame(taskID, runID string, entry *durablepb.JournalEntry
 	if err != nil {
 		return 0, 0, fmt.Errorf("marshal journal entry: %w", err)
 	}
-	frame := makeFrame(payload)
+	frame := makeFrame(payload, e.journalMACKey())
 
 	h, err := e.getOrOpenJournal(taskID, runID)
 	if err != nil {
@@ -273,10 +322,10 @@ func (e *Engine) getOrOpenJournal(taskID, runID string) (*journalFile, error) {
 	if v, ok := e.openFiles.Load(key); ok {
 		return v.(*journalFile), nil
 	}
-	if err := os.MkdirAll(e.runDir(taskID, runID), 0o755); err != nil {
+	if err := mkdirAllSecure(e.runDir(taskID, runID)); err != nil {
 		return nil, fmt.Errorf("create run dir: %w", err)
 	}
-	count, size, err := journalTail(e.dataDir, taskID, runID)
+	count, size, err := journalTail(e.dataDir, taskID, runID, e.journalMACKey())
 	if err != nil {
 		return nil, fmt.Errorf("scan journal tail: %w", err)
 	}
@@ -286,7 +335,7 @@ func (e *Engine) getOrOpenJournal(taskID, runID string) (*journalFile, error) {
 	if statErr != nil && !created {
 		return nil, fmt.Errorf("stat journal: %w", statErr)
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := openFileSecure(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY)
 	if err != nil {
 		return nil, fmt.Errorf("open journal: %w", err)
 	}
@@ -340,7 +389,7 @@ type frameVisit struct {
 // calls visit for every intact frame in append order. A torn or
 // CRC-mismatched tail stops the scan without error so a crash mid-append
 // cannot poison replay or resume.
-func scanJournal(dataDir, taskID, runID string, visit func(frameVisit)) error {
+func scanJournal(dataDir, taskID, runID string, macKey []byte, visit func(frameVisit)) error {
 	path := journalPath(dataDir, taskID, runID)
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -354,10 +403,11 @@ func scanJournal(dataDir, taskID, runID string, visit func(frameVisit)) error {
 	var idx int
 	var offset int64
 	for {
-		entry, frameLen, err := readFrame(f)
+		entry, frameLen, err := readFrame(f, macKey)
 		if err != nil {
 			// io.EOF is a clean end. Corrupt/truncated tail is also treated
 			// as end-of-valid-data so a kill -9 mid-write cannot fail resume.
+			// HMAC mismatch is fail-closed (tamper or wrong key).
 			if errors.Is(err, io.EOF) || errors.Is(err, errCorruptFrame) {
 				break
 			}
@@ -374,10 +424,10 @@ func scanJournal(dataDir, taskID, runID string, visit func(frameVisit)) error {
 // count and byte size, used to seed a freshly opened journalFile handle so
 // appendFrame can report correct Offset/ByteOffset without rescanning on
 // every write.
-func journalTail(dataDir, taskID, runID string) (int, int64, error) {
+func journalTail(dataDir, taskID, runID string, macKey []byte) (int, int64, error) {
 	var count int
 	var size int64
-	err := scanJournal(dataDir, taskID, runID, func(v frameVisit) {
+	err := scanJournal(dataDir, taskID, runID, macKey, func(v frameVisit) {
 		count = v.index
 		size = v.byteOffset
 	})
@@ -390,22 +440,34 @@ func journalTail(dataDir, taskID, runID string) (int, int64, error) {
 // step with no later WAITING/COMPLETED/FAILED record is treated as missing
 // on replay, so RunStep re-runs fn rather than getting stuck. A torn or
 // CRC-mismatched tail is discarded so a crash mid-append cannot poison replay.
-func loadJournal(dataDir, taskID, runID string) (map[string]StepRecord, map[string][]byte, error) {
-	steps, sigs, err := readJournalFrames(dataDir, taskID, runID)
+func loadJournal(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) (map[string]StepRecord, map[string][]byte, error) {
+	steps, sigs, err := readJournalFrames(dataDir, taskID, runID, macKey)
 	if err != nil {
 		return nil, nil, err
 	}
+	for id, rec := range steps {
+		decoded, err := decodeStepRecord(c, taskID, runID, rec)
+		if err != nil {
+			return nil, nil, fmt.Errorf("durable: decode step %s/%s/%s: %w", taskID, runID, id, err)
+		}
+		steps[id] = decoded
+	}
 	payloads := make(map[string][]byte, len(sigs))
 	for _, s := range sigs {
-		payloads[s.GetSignalId()] = s.GetPayload()
+		id := s.GetSignalId()
+		decoded, err := decodePayload(c, s.GetPayload(), payloadAAD(aadKindSignal, taskID, runID, id))
+		if err != nil {
+			return nil, nil, fmt.Errorf("durable: decode signal %s/%s/%s: %w", taskID, runID, id, err)
+		}
+		payloads[id] = decoded
 	}
 	return steps, payloads, nil
 }
 
-func readJournalFrames(dataDir, taskID, runID string) (map[string]StepRecord, []*durablepb.SignalEntry, error) {
+func readJournalFrames(dataDir, taskID, runID string, macKey []byte) (map[string]StepRecord, []*durablepb.SignalEntry, error) {
 	steps := make(map[string]StepRecord)
 	var signals []*durablepb.SignalEntry
-	err := scanJournal(dataDir, taskID, runID, func(v frameVisit) {
+	err := scanJournal(dataDir, taskID, runID, macKey, func(v frameVisit) {
 		switch e := v.entry.Entry.(type) {
 		case *durablepb.JournalEntry_Step:
 			if e.Step == nil {
@@ -433,9 +495,9 @@ func readJournalFrames(dataDir, taskID, runID string) (map[string]StepRecord, []
 // never last-write-wins. Offset and ByteOffset match what appendFrame
 // reported when each frame was written (SignalEntry frames advance the
 // shared counters but are not emitted here).
-func loadStepEvents(dataDir, taskID, runID string) ([]StepEvent, error) {
+func loadStepEvents(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) ([]StepEvent, error) {
 	var events []StepEvent
-	err := scanJournal(dataDir, taskID, runID, func(v frameVisit) {
+	err := scanJournal(dataDir, taskID, runID, macKey, func(v frameVisit) {
 		step, ok := v.entry.Entry.(*durablepb.JournalEntry_Step)
 		if !ok || step.Step == nil {
 			return
@@ -449,6 +511,13 @@ func loadStepEvents(dataDir, taskID, runID string) ([]StepEvent, error) {
 	if err != nil {
 		return nil, err
 	}
+	for i, ev := range events {
+		decoded, err := decodeStepRecord(c, taskID, runID, ev.StepRecord)
+		if err != nil {
+			return nil, fmt.Errorf("durable: decode step event %s/%s/%s: %w", taskID, runID, ev.StepID, err)
+		}
+		events[i].StepRecord = decoded
+	}
 	return events, nil
 }
 
@@ -459,7 +528,7 @@ func loadStepEvents(dataDir, taskID, runID string) ([]StepEvent, error) {
 // signals are an audit of external completions and must not be collapsed
 // away. Order is not preserved or sorted; only the map's current state matters.
 func (e *Engine) compactJournal(taskID, runID string) error {
-	steps, signals, err := readJournalFrames(e.dataDir, taskID, runID)
+	steps, signals, err := readJournalFrames(e.dataDir, taskID, runID, e.journalMACKey())
 	if err != nil {
 		return fmt.Errorf("durable: compact read %s/%s: %w", taskID, runID, err)
 	}
@@ -473,7 +542,7 @@ func (e *Engine) compactJournal(taskID, runID string) error {
 		if err != nil {
 			return fmt.Errorf("durable: compact marshal step %s/%s: %w", taskID, runID, err)
 		}
-		buf = append(buf, makeFrame(payload)...)
+		buf = append(buf, makeFrame(payload, e.journalMACKey())...)
 	}
 	for _, sig := range signals {
 		entry := &durablepb.JournalEntry{
@@ -483,7 +552,7 @@ func (e *Engine) compactJournal(taskID, runID string) error {
 		if err != nil {
 			return fmt.Errorf("durable: compact marshal signal %s/%s: %w", taskID, runID, err)
 		}
-		buf = append(buf, makeFrame(payload)...)
+		buf = append(buf, makeFrame(payload, e.journalMACKey())...)
 	}
 
 	e.closeJournal(taskID, runID)
@@ -582,21 +651,77 @@ func protoToStep(e *durablepb.StepEntry) StepRecord {
 	return r
 }
 
-func makeFrame(payload []byte) []byte {
-	frame := make([]byte, frameOverhead+len(payload))
+func frameTrailerSize(macKey []byte) int {
+	if len(macKey) == 0 {
+		return frameCRCSize
+	}
+	return frameHMACSize
+}
+
+func journalFrameMAC(macKey, lenPrefix, payload []byte) []byte {
+	mac := hmac.New(sha256.New, macKey)
+	_, _ = mac.Write([]byte(journalMACDomain))
+	_, _ = mac.Write(lenPrefix)
+	_, _ = mac.Write(payload)
+	return mac.Sum(nil)
+}
+
+func sidecarMAC(macKey []byte, domain, taskID, runID string, body []byte) []byte {
+	mac := hmac.New(sha256.New, macKey)
+	_, _ = mac.Write([]byte(domain))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(taskID))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(runID))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(body)
+	return mac.Sum(nil)
+}
+
+func wrapSidecarMAC(macKey []byte, domain, taskID, runID string, body []byte) []byte {
+	if len(macKey) == 0 {
+		return body
+	}
+	mac := sidecarMAC(macKey, domain, taskID, runID, body)
+	out := make([]byte, len(body)+len(mac))
+	copy(out, body)
+	copy(out[len(body):], mac)
+	return out
+}
+
+func unwrapSidecarMAC(macKey []byte, domain, taskID, runID string, raw []byte) ([]byte, error) {
+	if len(macKey) == 0 {
+		return raw, nil
+	}
+	if len(raw) < sha256.Size {
+		return nil, errFileMAC
+	}
+	body := raw[:len(raw)-sha256.Size]
+	if !hmac.Equal(raw[len(raw)-sha256.Size:], sidecarMAC(macKey, domain, taskID, runID, body)) {
+		return nil, errFileMAC
+	}
+	return body, nil
+}
+
+func makeFrame(payload, macKey []byte) []byte {
+	trail := frameTrailerSize(macKey)
+	frame := make([]byte, frameLenSize+len(payload)+trail)
 	binary.BigEndian.PutUint32(frame[0:4], uint32(len(payload)))
 	copy(frame[4:], payload)
-	checksum := crc32.ChecksumIEEE(payload)
-	binary.BigEndian.PutUint32(frame[4+len(payload):], checksum)
+	if len(macKey) == 0 {
+		checksum := crc32.ChecksumIEEE(payload)
+		binary.BigEndian.PutUint32(frame[4+len(payload):], checksum)
+		return frame
+	}
+	copy(frame[4+len(payload):], journalFrameMAC(macKey, frame[0:4], payload))
 	return frame
 }
 
-// readFrame reads one CRC-framed JournalEntry and returns it along with the
-// total on-disk size of the frame (length prefix + payload + CRC), so a
-// caller can accumulate a running byte offset. It returns io.EOF at a clean
-// end of file, and errCorruptFrame when the next bytes are a torn write or
-// CRC mismatch so the caller can stop without failing the whole replay.
-func readFrame(r io.Reader) (*durablepb.JournalEntry, int64, error) {
+// readFrame reads one framed JournalEntry and returns it along with the
+// total on-disk size of the frame. It returns io.EOF at a clean end of
+// file, errCorruptFrame for a torn write or CRC mismatch, and errJournalMAC
+// when WithJournalMACKey is set and the HMAC does not match.
+func readFrame(r io.Reader, macKey []byte) (*durablepb.JournalEntry, int64, error) {
 	var lenBuf [frameLenSize]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -614,19 +739,24 @@ func readFrame(r io.Reader) (*durablepb.JournalEntry, int64, error) {
 		return nil, 0, errCorruptFrame
 	}
 
-	var crcBuf [frameCRCSize]byte
-	if _, err := io.ReadFull(r, crcBuf[:]); err != nil {
+	trail := frameTrailerSize(macKey)
+	trailer := make([]byte, trail)
+	if _, err := io.ReadFull(r, trailer); err != nil {
 		return nil, 0, errCorruptFrame
 	}
-	storedCRC := binary.BigEndian.Uint32(crcBuf[:])
-	if storedCRC != crc32.ChecksumIEEE(payload) {
-		return nil, 0, errCorruptFrame
+	if len(macKey) == 0 {
+		storedCRC := binary.BigEndian.Uint32(trailer)
+		if storedCRC != crc32.ChecksumIEEE(payload) {
+			return nil, 0, errCorruptFrame
+		}
+	} else if !hmac.Equal(trailer, journalFrameMAC(macKey, lenBuf[:], payload)) {
+		return nil, 0, errJournalMAC
 	}
 
 	var entry durablepb.JournalEntry
 	if err := proto.Unmarshal(payload, &entry); err != nil {
 		return nil, 0, errCorruptFrame
 	}
-	total := int64(frameOverhead) + int64(payloadLen)
+	total := int64(frameLenSize+trail) + int64(payloadLen)
 	return &entry, total, nil
 }

@@ -48,17 +48,27 @@ type engineConfig struct {
 	timeout           time.Duration
 	logger            *slog.Logger
 	lockTimeout       time.Duration
+	codec             PayloadCodec
+	tokenSecret       []byte
+	tokenTTL          *time.Duration
+	journalMACKey     []byte
 }
 
-// EngineOption configures NewEngine.
-type EngineOption func(*engineConfig)
+// Option configures NewEngine and NewReadOnlyEngine.
+// Writer-only options (WithAutoPurge, WithMaxRetries, WithTimeout,
+// WithStepTokenKey, WithDefaultStepTokenTTL) are ignored by
+// NewReadOnlyEngine.
+type Option func(*engineConfig, *readOnlyConfig)
 
 // WithAutoPurge starts a background goroutine that deletes Completed and
 // Failed runs whose UpdatedAt is older than age. The optional interval
 // controls how often the purger runs; it defaults to one hour. Running and
-// Waiting runs are never purged.
-func WithAutoPurge(age time.Duration, interval ...time.Duration) EngineOption {
-	return func(c *engineConfig) {
+// Waiting runs are never purged. Ignored by NewReadOnlyEngine.
+func WithAutoPurge(age time.Duration, interval ...time.Duration) Option {
+	return func(c *engineConfig, _ *readOnlyConfig) {
+		if c == nil {
+			return
+		}
 		c.autoPurgeAge = age
 		if len(interval) > 0 {
 			c.autoPurgeInterval = interval[0]
@@ -69,31 +79,74 @@ func WithAutoPurge(age time.Duration, interval ...time.Duration) EngineOption {
 // WithMaxRetries sets the engine-wide default for task-level retries
 // (re-invoking the task closure). Default is 0 — retries are opt-in so
 // non-idempotent work is not silently repeated. Overridden by
-// WithTaskMaxRetries and WithRunMaxRetries.
-func WithMaxRetries(n int) EngineOption {
-	return func(c *engineConfig) { c.maxRetries = n }
-}
-
-// WithTimeout sets the engine-wide default task deadline. Zero (default)
-// means no timeout. Overridden by WithTaskTimeout and WithRunTimeout.
-func WithTimeout(d time.Duration) EngineOption {
-	return func(c *engineConfig) { c.timeout = d }
-}
-
-// WithLogger sets the slog.Logger used for task and step lifecycle events.
-// If nil or omitted, a discard logger is used.
-func WithLogger(l *slog.Logger) EngineOption {
-	return func(c *engineConfig) {
-		if l != nil {
-			c.logger = l
+// WithTaskMaxRetries and WithRunMaxRetries. Ignored by NewReadOnlyEngine.
+func WithMaxRetries(n int) Option {
+	return func(c *engineConfig, _ *readOnlyConfig) {
+		if c != nil {
+			c.maxRetries = n
 		}
 	}
 }
 
-// WithLockTimeout sets how long NewEngine waits for the exclusive flock.
-// Default is 2 seconds.
-func WithLockTimeout(d time.Duration) EngineOption {
-	return func(c *engineConfig) { c.lockTimeout = d }
+// WithTimeout sets the engine-wide default task deadline. Zero (default)
+// means no timeout. Overridden by WithTaskTimeout and WithRunTimeout.
+// Ignored by NewReadOnlyEngine.
+func WithTimeout(d time.Duration) Option {
+	return func(c *engineConfig, _ *readOnlyConfig) {
+		if c != nil {
+			c.timeout = d
+		}
+	}
+}
+
+// WithLogger sets the slog.Logger for NewEngine and NewReadOnlyEngine.
+// If nil or omitted, a discard logger is used.
+func WithLogger(l *slog.Logger) Option {
+	return func(e *engineConfig, r *readOnlyConfig) {
+		if l == nil {
+			return
+		}
+		if e != nil {
+			e.logger = l
+		}
+		if r != nil {
+			r.logger = l
+		}
+	}
+}
+
+// WithLockTimeout sets how long NewEngine waits for the exclusive flock
+// and NewReadOnlyEngine waits for the shared flock. Default is 2 seconds.
+func WithLockTimeout(d time.Duration) Option {
+	return func(e *engineConfig, r *readOnlyConfig) {
+		if e != nil {
+			e.lockTimeout = d
+		}
+		if r != nil {
+			r.lockTimeout = d
+		}
+	}
+}
+
+// WithJournalMACKey signs journal.log frames and the run sidecar files
+// (input.json, output.json, meta.json) with HMAC-SHA256. Sidecar MACs are
+// bound to taskID/runID so a file cannot be copied between runs. Omit it
+// (or pass nil/empty) to keep CRC32 journal trailers and unsigned JSON
+// sidecars, the default. The key is copied and never written under
+// dataDir. Required on NewReadOnlyEngine to read a MAC-signed tree.
+func WithJournalMACKey(key []byte) Option {
+	return func(e *engineConfig, r *readOnlyConfig) {
+		if len(key) == 0 {
+			return
+		}
+		owned := append([]byte(nil), key...)
+		if e != nil {
+			e.journalMACKey = owned
+		}
+		if r != nil {
+			r.journalMACKey = owned
+		}
+	}
 }
 
 // Engine is the process-level entry point for durable task execution.
@@ -137,7 +190,7 @@ type stepWatchSet struct {
 // NewEngine opens or creates dataDir, acquires an exclusive flock on
 // <dataDir>/.lock, and initialises the in-memory task registry. Fails with
 // ErrEngineLocked if another Engine or ReadOnlyEngine holds the directory.
-func NewEngine(ctx context.Context, dataDir string, opts ...EngineOption) (*Engine, error) {
+func NewEngine(ctx context.Context, dataDir string, opts ...Option) (*Engine, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("durable: context must not be nil")
 	}
@@ -150,16 +203,17 @@ func NewEngine(ctx context.Context, dataDir string, opts ...EngineOption) (*Engi
 		lockTimeout: defaultLockTimeout,
 	}
 	for _, o := range opts {
-		o(&cfg)
+		o(&cfg, nil)
 	}
 
 	absDir, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("durable: resolve dataDir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(absDir, tasksDirName), 0o755); err != nil {
+	if err := mkdirAllSecure(filepath.Join(absDir, tasksDirName)); err != nil {
 		return nil, fmt.Errorf("durable: create dataDir %q: %w", absDir, err)
 	}
+	tightenDataDir(absDir)
 	if err := ensureWritable(absDir); err != nil {
 		return nil, err
 	}
@@ -173,6 +227,8 @@ func NewEngine(ctx context.Context, dataDir string, opts ...EngineOption) (*Engi
 		releaseOccupancy(absDir, true)
 		return nil, err
 	}
+	chmodBestEffort(lockPath(absDir), filePerm)
+	warnIfInsecure(absDir, cfg.logger)
 
 	e := &Engine{
 		dataDir:  absDir,
@@ -191,7 +247,7 @@ func NewEngine(ctx context.Context, dataDir string, opts ...EngineOption) (*Engi
 
 func ensureWritable(dir string) error {
 	path := filepath.Join(dir, permTestFileName)
-	f, err := os.Create(path)
+	f, err := openFileSecure(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return fmt.Errorf("durable: dataDir %q is not writable: %w", dir, err)
 	}
@@ -262,7 +318,7 @@ func (e *Engine) purgeOlderThan(age time.Duration) error {
 	cutoff := time.Now().UTC().Add(-age)
 	e.cfg.logger.Debug("auto-purge running", "cutoff", cutoff)
 
-	tasks, err := listTasks(context.Background(), e.dataDir)
+	tasks, err := listTasks(context.Background(), e.dataDir, e.journalMACKey())
 	if err != nil {
 		return err
 	}
@@ -400,28 +456,10 @@ func (e *Engine) lookupTask(taskID string) (taskEntry, bool) {
 }
 
 type readOnlyConfig struct {
-	lockTimeout time.Duration
-	logger      *slog.Logger
-}
-
-// ReadOnlyOption configures NewReadOnlyEngine.
-type ReadOnlyOption func(*readOnlyConfig)
-
-// WithROLockTimeout sets how long NewReadOnlyEngine waits for the shared flock.
-// Default is 2 seconds. Named distinctly from WithLockTimeout because both
-// option types live in the same package.
-func WithROLockTimeout(d time.Duration) ReadOnlyOption {
-	return func(c *readOnlyConfig) { c.lockTimeout = d }
-}
-
-// WithROLogger sets the slog.Logger for the read-only engine. Named
-// distinctly from WithLogger because both option types live in the same package.
-func WithROLogger(l *slog.Logger) ReadOnlyOption {
-	return func(c *readOnlyConfig) {
-		if l != nil {
-			c.logger = l
-		}
-	}
+	lockTimeout   time.Duration
+	logger        *slog.Logger
+	codec         PayloadCodec
+	journalMACKey []byte
 }
 
 // ReadOnlyEngine is a compile-time-restricted view of a dataDir. It acquires
@@ -437,7 +475,7 @@ type ReadOnlyEngine struct {
 // NewReadOnlyEngine acquires a shared flock on <dataDir>/.lock. Multiple
 // readers coexist. Returns ErrEngineLocked after the lock timeout if a
 // writer holds the exclusive lock.
-func NewReadOnlyEngine(dataDir string, opts ...ReadOnlyOption) (*ReadOnlyEngine, error) {
+func NewReadOnlyEngine(dataDir string, opts ...Option) (*ReadOnlyEngine, error) {
 	if dataDir == "" {
 		return nil, fmt.Errorf("durable: dataDir must not be empty")
 	}
@@ -446,7 +484,7 @@ func NewReadOnlyEngine(dataDir string, opts ...ReadOnlyOption) (*ReadOnlyEngine,
 		lockTimeout: defaultLockTimeout,
 	}
 	for _, o := range opts {
-		o(&cfg)
+		o(nil, &cfg)
 	}
 
 	absDir, err := filepath.Abs(dataDir)
@@ -466,6 +504,7 @@ func NewReadOnlyEngine(dataDir string, opts ...ReadOnlyOption) (*ReadOnlyEngine,
 		releaseOccupancy(absDir, false)
 		return nil, err
 	}
+	chmodBestEffort(lockPath(absDir), filePerm)
 
 	r := &ReadOnlyEngine{
 		dataDir:  absDir,
