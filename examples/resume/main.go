@@ -1,6 +1,6 @@
 // Package main is a self-contained crash/resume demo.
 //
-//	go run ./examples/resume/
+//	go run .
 //
 // One process starts a run, persists steps 1–2, then exits without Close
 // (simulated crash). A second Engine opens the same dataDir and resumes:

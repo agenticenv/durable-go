@@ -34,5 +34,5 @@ nothing to approve.
 ## Reset
 
 ```bash
-rm -rf examples/fanout/.data/
+rm -rf .data/
 ```

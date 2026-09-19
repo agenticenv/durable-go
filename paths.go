@@ -7,12 +7,13 @@ import (
 )
 
 const (
-	tasksDirName    = "tasks"
-	metaFileName    = "meta.json"
-	journalFileName = "journal.log"
-	outputFileName  = "output.json"
-	inputFileName   = "input.json"
-	lockFileName    = ".lock"
+	tasksDirName      = "tasks"
+	metaFileName      = "meta.json"
+	journalFileName   = "journal.log"
+	outputFileName    = "output.json"
+	inputFileName     = "input.json"
+	lockFileName      = ".lock"
+	permsSentinelName = ".perms_ok"
 )
 
 func taskDir(dataDir, taskID string) string {

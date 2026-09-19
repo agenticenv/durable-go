@@ -45,13 +45,13 @@ export DURABLE_DIR=./data
 ./bin/durable-inspect --dir=./data task list
 ```
 
-Example journals after `go run ./examples/<name>/` live under `examples/<name>/.data/<journal>/` (gitignored).
+Example journals after `cd examples && go run ./<name>/` live under `examples/<name>/.data/<journal>/` (gitignored).
 
 ```bash
-go run ./examples/yaml-task/
+cd examples && go run ./yaml-task/
 ./bin/durable-inspect -d examples/yaml-task/.data/yaml-journal task list
 
-go run ./examples/payload-codec/
+cd examples && go run ./payload-codec/
 export DURABLE_PAYLOAD_KEY="$KEY"
 export DURABLE_JOURNAL_MAC_KEY="$MAC"
 ./bin/durable-inspect -d examples/payload-codec/.data/aes --redact task get echo run-1

@@ -14,7 +14,7 @@ Before contributing, ensure you have:
 
 | Requirement | Version / Notes |
 |-------------|-----------------|
-| **Go** | **Minimum `go 1.26.5`** (see the `go` line in `go.mod`; use that version or newer). |
+| **Go** | **Minimum `go 1.26`** (see the `go` line in `go.mod`; use that version or newer). |
 | **Task** | Task runner for all dev commands (`task build`, `task check`, `task lint`, ...). Install: `go install github.com/go-task/task/v3/cmd/task@latest` or see [taskfile.dev/installation](https://taskfile.dev/installation/) |
 | **golangci-lint** | Required for `task lint` — install **v2** with Go **≥** the `go` line in `go.mod`: `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest` |
 | **gofmt** | `task lint` runs `gofmt -s` check first; run `task fmt` to apply `gofmt -s -w` project-wide |
@@ -123,10 +123,10 @@ task test-coverage
 
 ### 6. Run examples
 
-From the repo root:
+From `examples/`:
 
 ```bash
-go run ./examples/<name>/
+go run ./<name>/
 ```
 
 See [examples/README.md](examples/README.md) for the full list. Journal store data is written under `examples/<name>/.data/` (gitignored). `examples/resume/` uses a temp dir and prints the path.

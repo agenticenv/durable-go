@@ -46,6 +46,18 @@ var (
 	// past its TTL.
 	ErrTokenExpired = errors.New("durable: step token expired")
 
+	// ErrPayloadTooLarge is returned when a step's persisted record does not
+	// fit in one journal frame (32 MiB of encoded input plus result). The step
+	// fails rather than writing a frame that replay and compaction could not
+	// read back. Keep large blobs out of step results — store a handle and
+	// fetch the payload inside fn.
+	ErrPayloadTooLarge = errors.New("durable: payload too large for one journal frame")
+
+	// ErrEngineClosed is returned by RunTask when the Engine is already
+	// closing or closed, so no new run is started after the exclusive flock
+	// on dataDir has been released.
+	ErrEngineClosed = errors.New("durable: engine is closed")
+
 	// ErrRunCancelled is the error stored on a run (TaskInfo.Error, as its
 	// string form) and returned by RunStep/Get after CancelRun. It marks
 	// the run as StatusFailed for the same reason engine Close and task/run

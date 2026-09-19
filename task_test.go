@@ -295,7 +295,7 @@ func TestRunTask_ResumeReplaysSteps(t *testing.T) {
 func TestRunTask_ResumeUsesStoredInput(t *testing.T) {
 	src := t.TempDir()
 	ctx := context.Background()
-	e1, err := durable.NewEngine(ctx, src)
+	e1, err := durable.NewEngine(ctx, src, durable.WithUnsignedStepTokens())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestRunTask_ResumeUsesStoredInput(t *testing.T) {
 	}
 	_ = e1.Close()
 
-	e2, err := durable.NewEngine(ctx, dst)
+	e2, err := durable.NewEngine(ctx, dst, durable.WithUnsignedStepTokens())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,6 +701,32 @@ func TestDeleteTask_ActiveReturnsErrRunActive(t *testing.T) {
 	err := e.DeleteTask(context.Background(), "approve")
 	if !errors.Is(err, durable.ErrRunActive) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestListTasksPage(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "echo", identityTask()); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"r1", "r2", "r3"} {
+		if _, err := durable.RunTask[string, string](context.Background(), e, "echo", id, "x").Get(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := e.ListTasksPage(context.Background(), 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Tasks) != 2 || !page.HasMore {
+		t.Fatalf("page %+v", page)
+	}
+	rest, err := e.ListTasksPage(context.Background(), 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest.Tasks) != 1 || rest.HasMore {
+		t.Fatalf("rest %+v", rest)
 	}
 }
 

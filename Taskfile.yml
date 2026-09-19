@@ -29,6 +29,8 @@ tasks:
     cmds:
       - echo "==> Building durable-go..."
       - go build ./...
+      - go build -C examples ./...
+      - go build -C benchmarks -o /dev/null .
       - mkdir -p bin
       - go build -o bin/durable-inspect ./cmd/durable-inspect
       - echo "==> Build complete (bin/durable-inspect)"
@@ -49,7 +51,9 @@ tasks:
     desc: Run all tests
     cmds:
       - echo "==> Running tests..."
-      - go test ./... -count=1
+      - go test ./... -count=1 -race
+      - go test -C examples ./... -count=1
+      - go test -C benchmarks ./... -count=1
       - echo "==> Tests complete"
 
   test-coverage:
@@ -58,7 +62,7 @@ tasks:
       GOTOOLCHAIN: '{{.GOTOOLCHAIN_COVERAGE}}'
     cmds:
       - echo "==> Running tests with coverage..."
-      - go test $(go list ./... | grep -v '/examples/' | grep -v '/benchmarks/') -count=1 -coverprofile=coverage.out
+      - go test ./... -count=1 -coverprofile=coverage.out
       - echo "==> Total coverage:"
       - go tool cover -func=coverage.out | grep '^total:'
       - go tool cover -html=coverage.out -o coverage.html
@@ -127,6 +131,8 @@ tasks:
     cmds:
       - echo "==> Tidying module dependencies..."
       - go mod tidy
+      - go mod tidy -C examples
+      - go mod tidy -C benchmarks
       - echo "==> Tidy complete"
 
   # ── Clean ─────────────────────────────────────────────────────────────────
@@ -162,12 +168,8 @@ tasks:
         if ! command -v govulncheck >/dev/null 2>&1; then
           go install golang.org/x/vuln/cmd/govulncheck@latest
         fi
-        tc=$(awk '/^toolchain / { print $2; exit }' go.mod)
-        if [ -z "$tc" ]; then
-          tc=$(awk '/^go / { print "go" $2; exit }' go.mod)
-        fi
-        echo "==> GOTOOLCHAIN=$tc"
-        GOTOOLCHAIN="$tc" govulncheck ./...
+        echo "==> GOTOOLCHAIN={{.GOTOOLCHAIN_COVERAGE}}"
+        GOTOOLCHAIN="{{.GOTOOLCHAIN_COVERAGE}}" govulncheck ./...
         echo "==> govulncheck complete"
 
   # ── All-in-one gate (run before push) ────────────────────────────────────

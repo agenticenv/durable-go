@@ -16,5 +16,5 @@ go run .
 ## Reset
 
 ```bash
-rm -rf examples/struct-task/.data/
+rm -rf .data/
 ```

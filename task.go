@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -45,6 +46,14 @@ type TaskInfo struct {
 	StartedAt   time.Time         `json:"started_at"`
 	CompletedAt time.Time         `json:"completed_at"`
 	UpdatedAt   time.Time         `json:"updated_at"`
+	// OwnerPID is the process that last wrote this meta while the run was
+	// Running. After a crash it still names the dead process, so operators
+	// can tell an orphaned in-flight run from one this engine started.
+	OwnerPID int `json:"owner_pid,omitempty"`
+	// JournalGeneration increments each time compactJournal rewrites
+	// journal.log. WatchSteps Offset/ByteOffset are only valid for the
+	// generation they were observed in.
+	JournalGeneration int `json:"journal_generation,omitempty"`
 }
 
 // Task is the execution contract for a durable task.
@@ -398,7 +407,23 @@ func RunTask[I, O any](ctx context.Context, e *Engine, taskID string, runID stri
 	}
 	h.cancel = cancel
 	runKey := taskID + "/" + resolved
-	e.runCancels.Store(runKey, h)
+
+	e.mu.Lock()
+	select {
+	case <-e.stopCh:
+		e.mu.Unlock()
+		cancel()
+		return failedTaskRun[O](ErrEngineClosed)
+	default:
+	}
+	if actual, loaded := e.runCancels.LoadOrStore(runKey, h); loaded {
+		e.mu.Unlock()
+		cancel()
+		return &TaskRun[O]{h: actual.(*runHandle)}
+	}
+	e.runs.Add(1)
+	e.mu.Unlock()
+
 	stopWatchDone := make(chan struct{})
 	go func() {
 		select {
@@ -407,14 +432,24 @@ func RunTask[I, O any](ctx context.Context, e *Engine, taskID string, runID stri
 		case <-stopWatchDone:
 		}
 	}()
-	e.runs.Add(1)
 	go func() {
 		defer e.runs.Done()
 		defer close(stopWatchDone)
 		defer cancel()
-		defer e.runCancels.Delete(runKey)
-		mu := e.lockRun(taskID, resolved)
-		defer mu.Unlock()
+		defer func() {
+			if v, ok := e.runCancels.Load(runKey); ok && v.(*runHandle) == h {
+				e.runCancels.Delete(runKey)
+			}
+		}()
+		mu, err := e.lockRun(taskID, resolved)
+		if err != nil {
+			h.finish(nil, err)
+			return
+		}
+		defer e.unlockRun(taskID, resolved, mu)
+		defer e.closeJournal(taskID, resolved)
+		defer e.pruneSignalLocks(taskID, resolved)
+		defer e.dropIdleRunLock(taskID, resolved)
 		e.executeRun(runCtx, cancel, taskID, resolved, entry, inputBytes, maxRetries, h)
 	}()
 	return &TaskRun[O]{h: h}
@@ -463,12 +498,6 @@ func (e *Engine) executeRun(ctx context.Context, cancel context.CancelFunc, task
 		return
 	}
 
-	input, err = e.resolveRunInput(taskID, runID, input)
-	if err != nil {
-		h.finish(nil, err)
-		return
-	}
-
 	now := time.Now().UTC()
 	if !exists {
 		info = TaskInfo{
@@ -480,7 +509,10 @@ func (e *Engine) executeRun(ctx context.Context, cancel context.CancelFunc, task
 			CreatedAt: now,
 			StartedAt: now,
 			UpdatedAt: now,
+			OwnerPID:  os.Getpid(),
 		}
+		// meta.json first so a crash before input.json still leaves a run
+		// listTasks and purge can see, instead of an invisible directory.
 		if err := e.saveMeta(taskID, runID, info); err != nil {
 			h.finish(nil, err)
 			return
@@ -488,10 +520,17 @@ func (e *Engine) executeRun(ctx context.Context, cancel context.CancelFunc, task
 	} else {
 		info.Status = StatusRunning
 		info.UpdatedAt = now
+		info.OwnerPID = os.Getpid()
 		if err := e.saveMeta(taskID, runID, info); err != nil {
 			h.finish(nil, err)
 			return
 		}
+	}
+
+	input, err = e.resolveRunInput(taskID, runID, input)
+	if err != nil {
+		h.finish(nil, err)
+		return
 	}
 	h.setStatus(StatusRunning)
 
@@ -578,7 +617,14 @@ func (e *Engine) executeRun(ctx context.Context, cancel context.CancelFunc, task
 	}
 
 	now = time.Now().UTC()
-	info, _, _ = e.loadMeta(taskID, runID)
+	info, ok, err := e.loadMeta(taskID, runID)
+	if err != nil {
+		h.finish(nil, err)
+		return
+	}
+	if !ok {
+		info = TaskInfo{TaskID: taskID, RunID: runID}
+	}
 	info.TaskID = taskID
 	info.RunID = runID
 	info.UpdatedAt = now
@@ -678,7 +724,7 @@ func (e *Engine) LoadSteps(ctx context.Context, taskID, runID string) ([]StepRec
 	if err := validateRunID(runID); err != nil {
 		return nil, err
 	}
-	return loadStepRecords(e.dataDir, taskID, runID, e.codec(), e.journalMACKey())
+	return loadStepRecords(e.dataDir, taskID, runID, e.codec(), e.journalMACKey(), e.log())
 }
 
 // GetStep returns the latest StepRecord for one stepID in O(1) after one
@@ -721,7 +767,7 @@ func (r *ReadOnlyEngine) GetStep(ctx context.Context, taskID, runID, stepID stri
 	if stepID == "" {
 		return StepRecord{}, false, fmt.Errorf("durable: step ID must not be empty")
 	}
-	steps, _, err := loadJournal(r.dataDir, taskID, runID, r.codec(), r.journalMACKey())
+	steps, _, err := loadJournal(r.dataDir, taskID, runID, r.codec(), r.journalMACKey(), r.log())
 	if err != nil {
 		return StepRecord{}, false, err
 	}
@@ -742,6 +788,10 @@ type StepEvent struct {
 	StepRecord
 	Offset     int
 	ByteOffset int64
+	// Generation is TaskInfo.JournalGeneration when this event was
+	// observed. compactJournal increments it and rewrites offsets from 1,
+	// so a WatchSteps cursor is only valid while Generation is unchanged.
+	Generation int
 }
 
 // WatchSteps streams step lifecycle events for a run: STARTED, WAITING,
@@ -911,13 +961,16 @@ func (e *Engine) DeleteTaskRun(ctx context.Context, taskID, runID string) error 
 	if !ok {
 		return ErrRunActive
 	}
-	defer mu.Unlock()
+	defer e.unlockRun(taskID, runID, mu)
 
 	e.closeJournal(taskID, runID)
+	parent := e.taskDir(taskID)
 	if err := os.RemoveAll(e.runDir(taskID, runID)); err != nil {
 		return err
 	}
-	e.runLocks.Delete(taskID + "/" + runID)
+	_ = syncDirFn(parent)
+	e.markRunDeleted(mu)
+	e.pruneSignalLocks(taskID, runID)
 	e.cfg.logger.Debug("run deleted", "task_id", taskID, "run_id", runID)
 	return nil
 }
@@ -938,12 +991,12 @@ func (e *Engine) DeleteTask(ctx context.Context, taskID string) error {
 		return err
 	}
 
-	held := make([]*sync.Mutex, 0, len(ids))
+	held := make([]*runLock, 0, len(ids))
 	for _, id := range ids {
 		mu, ok := e.tryLockRun(taskID, id)
 		if !ok {
-			for _, m := range held {
-				m.Unlock()
+			for i, m := range held {
+				e.unlockRun(taskID, ids[i], m)
 			}
 			return ErrRunActive
 		}
@@ -953,15 +1006,18 @@ func (e *Engine) DeleteTask(ctx context.Context, taskID string) error {
 	for _, id := range ids {
 		e.closeJournal(taskID, id)
 	}
+	parent := filepath.Dir(e.taskDir(taskID))
 	if err := os.RemoveAll(e.taskDir(taskID)); err != nil {
-		for _, m := range held {
-			m.Unlock()
+		for i, m := range held {
+			e.unlockRun(taskID, ids[i], m)
 		}
 		return err
 	}
+	_ = syncDirFn(parent)
 	for i, id := range ids {
-		e.runLocks.Delete(taskID + "/" + id)
-		held[i].Unlock()
+		e.markRunDeleted(held[i])
+		e.pruneSignalLocks(taskID, id)
+		e.unlockRun(taskID, id, held[i])
 	}
 	e.cfg.logger.Debug("task deleted", "task_id", taskID)
 	return nil
@@ -1029,6 +1085,112 @@ func listTasks(ctx context.Context, dataDir string, macKey []byte, statuses ...T
 	return out, nil
 }
 
+// TaskPage is one window of ListTasksPage.
+type TaskPage struct {
+	Tasks   []TaskInfo
+	Offset  int
+	Limit   int
+	HasMore bool
+}
+
+// ListTasksPage is ListTasks with a 0-based offset into the sorted result.
+// limit <= 0 means the rest of the list. Use it when dataDir holds more
+// runs than you want to load at once (recovery, dashboards, purge).
+func (e *Engine) ListTasksPage(ctx context.Context, offset, limit int, statuses ...TaskStatus) (TaskPage, error) {
+	return listTasksPage(ctx, e.dataDir, e.journalMACKey(), offset, limit, statuses...)
+}
+
+// ListTasksPage is ListTasksPage for a read-only engine.
+func (r *ReadOnlyEngine) ListTasksPage(ctx context.Context, offset, limit int, statuses ...TaskStatus) (TaskPage, error) {
+	return listTasksPage(ctx, r.dataDir, r.journalMACKey(), offset, limit, statuses...)
+}
+
+func listTasksPage(ctx context.Context, dataDir string, macKey []byte, offset, limit int, statuses ...TaskStatus) (TaskPage, error) {
+	all, err := listTasks(ctx, dataDir, macKey, statuses...)
+	if err != nil {
+		return TaskPage{}, err
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(all) {
+		offset = len(all)
+	}
+	end := len(all)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	page := TaskPage{
+		Tasks:   all[offset:end],
+		Offset:  offset,
+		Limit:   limit,
+		HasMore: end < len(all),
+	}
+	return page, nil
+}
+
+// walkRuns visits every run that has a readable meta.json, with the on-disk
+// size of that run directory. Used by purge so it does not sort or allocate
+// the full ListTasks snapshot when it only needs terminal runs.
+func walkRuns(dataDir string, macKey []byte, visit func(info TaskInfo, size int64) error) error {
+	taskEntries, err := os.ReadDir(filepath.Join(dataDir, tasksDirName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, te := range taskEntries {
+		if !te.IsDir() {
+			continue
+		}
+		taskID := te.Name()
+		runs, err := scanRuns(dataDir, taskID)
+		if err != nil {
+			return err
+		}
+		for _, runID := range runs {
+			info, ok, err := loadMeta(dataDir, taskID, runID, macKey)
+			if err != nil {
+				if len(macKey) > 0 {
+					return err
+				}
+				continue
+			}
+			if !ok {
+				continue
+			}
+			size, err := dirSize(runDir(dataDir, taskID, runID))
+			if err != nil {
+				size = 0
+			}
+			if err := visit(info, size); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func dirSize(path string) (int64, error) {
+	var n int64
+	err := filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		n += info.Size()
+		return nil
+	})
+	return n, err
+}
+
 // ListTasks returns TaskInfo records with the same filter semantics as Engine.ListTasks.
 func (r *ReadOnlyEngine) ListTasks(ctx context.Context, statuses ...TaskStatus) ([]TaskInfo, error) {
 	return listTasks(ctx, r.dataDir, r.journalMACKey(), statuses...)
@@ -1063,7 +1225,7 @@ func (r *ReadOnlyEngine) LoadInput(ctx context.Context, taskID, runID string) ([
 	return loadInput(r.dataDir, taskID, runID, r.codec(), r.journalMACKey())
 }
 
-// LoadSteps returns all StepRecords for a run ordered by Seq.
+// LoadSteps returns all StepRecords for a run. Same semantics as Engine.LoadSteps.
 func (r *ReadOnlyEngine) LoadSteps(ctx context.Context, taskID, runID string) ([]StepRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1074,11 +1236,11 @@ func (r *ReadOnlyEngine) LoadSteps(ctx context.Context, taskID, runID string) ([
 	if err := validateRunID(runID); err != nil {
 		return nil, err
 	}
-	return loadStepRecords(r.dataDir, taskID, runID, r.codec(), r.journalMACKey())
+	return loadStepRecords(r.dataDir, taskID, runID, r.codec(), r.journalMACKey(), r.log())
 }
 
-func loadStepRecords(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) ([]StepRecord, error) {
-	steps, _, err := loadJournal(dataDir, taskID, runID, c, macKey)
+func loadStepRecords(dataDir, taskID, runID string, c PayloadCodec, macKey []byte, logger *slog.Logger) ([]StepRecord, error) {
+	steps, _, err := loadJournal(dataDir, taskID, runID, c, macKey, logger)
 	if err != nil {
 		return nil, err
 	}

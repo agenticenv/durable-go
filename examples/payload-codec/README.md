@@ -6,10 +6,10 @@ Existing examples (`func-task`, `resume`, …) stay default `NewEngine` (plainte
 
 ## Run
 
-From the **repo root**:
+From this directory:
 
 ```bash
-go run ./examples/payload-codec/
+go run .
 ```
 
 Optional env (otherwise demo values are used — not for production):
@@ -63,7 +63,7 @@ This example uses an in-process `DEMO:` prefix stub so `go run` needs no cloud. 
 
 ### 4. HMAC step tokens
 
-Unsigned tokens (no expiry) unless a key is set. With `WithStepTokenKey`, tokens are HMAC `v1.…` and default to 24h TTL:
+HMAC `v1.…` tokens are the default (process-ephemeral key, 24h TTL). Persist a key so tokens survive a restart; `WithUnsignedStepTokens` opts out:
 
 ```go
 e, err := durable.NewEngine(ctx, "./data",
@@ -115,5 +115,5 @@ See [Data privacy](../../README.md#data-privacy--sensitive-payloads) and [`cmd/d
 ## Reset
 
 ```bash
-rm -rf examples/payload-codec/.data/
+rm -rf .data/
 ```

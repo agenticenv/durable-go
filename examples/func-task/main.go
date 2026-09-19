@@ -10,6 +10,7 @@ import (
 	"log"
 
 	durable "github.com/agenticenv/durable-go"
+	"github.com/agenticenv/durable-go/examples/internal/exdir"
 )
 
 type PaymentRequest struct {
@@ -72,7 +73,7 @@ var processPayment = durable.Func(func(
 func main() {
 	ctx := context.Background()
 
-	e, err := durable.NewEngine(ctx, "examples/func-task/.data/payment-journal")
+	e, err := durable.NewEngine(ctx, exdir.Data("func-task", "payment-journal"))
 	if err != nil {
 		log.Fatal(err)
 	}

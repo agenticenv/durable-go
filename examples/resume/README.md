@@ -4,11 +4,10 @@ One `go run` proves crash recovery: persist two steps, exit without `Close`, reo
 
 ## Run
 
-From the repo root, or from this directory:
+From this directory:
 
 ```bash
-go run ./examples/resume/
-# or: go run .
+go run .
 ```
 
 ## Expected output

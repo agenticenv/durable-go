@@ -1,8 +1,8 @@
 // Package main runs a YAML workflow file as one durable-go task.
 // Each steps[].id is a RunStep; the YAML is the task spec (passed as input).
 //
-//	go run ./examples/yaml-task/
-//	CRASH_AFTER=2 go run ./examples/yaml-task/   # crash after step 2, then re-run to resume
+//	go run .
+//	CRASH_AFTER=2 go run .   # crash after step 2, then re-run to resume
 package main
 
 import (
@@ -12,8 +12,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	durable "github.com/agenticenv/durable-go"
+	"github.com/agenticenv/durable-go/examples/internal/exdir"
 	"gopkg.in/yaml.v3"
 )
 
@@ -81,7 +83,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	e, err := durable.NewEngine(ctx, "examples/yaml-task/.data/yaml-journal")
+	e, err := durable.NewEngine(ctx, exdir.Data("yaml-task", "yaml-journal"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -111,23 +113,19 @@ func main() {
 }
 
 func loadWorkflow() (Workflow, error) {
-	var lastErr error
-	for _, p := range []string{"workflow.yaml", "examples/yaml-task/workflow.yaml"} {
-		b, err := os.ReadFile(p)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		var wf Workflow
-		if err := yaml.Unmarshal(b, &wf); err != nil {
-			return Workflow{}, fmt.Errorf("%s: %w", p, err)
-		}
-		if err := validateWorkflow(wf); err != nil {
-			return Workflow{}, fmt.Errorf("%s: %w", p, err)
-		}
-		return wf, nil
+	p := filepath.Join(exdir.Dir("yaml-task"), "workflow.yaml")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return Workflow{}, fmt.Errorf("read workflow.yaml: %w", err)
 	}
-	return Workflow{}, fmt.Errorf("read workflow.yaml: %w", lastErr)
+	var wf Workflow
+	if err := yaml.Unmarshal(b, &wf); err != nil {
+		return Workflow{}, fmt.Errorf("%s: %w", p, err)
+	}
+	if err := validateWorkflow(wf); err != nil {
+		return Workflow{}, fmt.Errorf("%s: %w", p, err)
+	}
+	return wf, nil
 }
 
 func validateWorkflow(wf Workflow) error {

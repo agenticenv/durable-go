@@ -33,9 +33,9 @@ func TestMakeReadFrame_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := makeFrame(payload, nil)
+	frame := makeFrame(payload, nil, "", "", 1)
 
-	got, size, err := readFrame(bytes.NewReader(frame), nil)
+	got, size, err := readFrame(bytes.NewReader(frame), nil, "", "", 1)
 	if err != nil {
 		t.Fatalf("readFrame: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestMakeReadFrame_RoundTrip(t *testing.T) {
 }
 
 func TestReadFrame_EOFAtEnd(t *testing.T) {
-	_, _, err := readFrame(bytes.NewReader(nil), nil)
+	_, _, err := readFrame(bytes.NewReader(nil), nil, "", "", 1)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("empty reader: got %v, want io.EOF", err)
 	}
@@ -72,10 +72,10 @@ func TestReadFrame_CRCCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := makeFrame(payload, nil)
+	frame := makeFrame(payload, nil, "", "", 1)
 	frame[len(frame)-1] ^= 0xff
 
-	_, _, err = readFrame(bytes.NewReader(frame), nil)
+	_, _, err = readFrame(bytes.NewReader(frame), nil, "", "", 1)
 	if !errors.Is(err, errCorruptFrame) {
 		t.Fatalf("corrupt CRC: got %v, want errCorruptFrame", err)
 	}
@@ -89,10 +89,10 @@ func TestReadFrame_PartialTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := makeFrame(payload, nil)
+	frame := makeFrame(payload, nil, "", "", 1)
 	truncated := frame[:len(frame)/2]
 
-	_, _, err = readFrame(bytes.NewReader(truncated), nil)
+	_, _, err = readFrame(bytes.NewReader(truncated), nil, "", "", 1)
 	if !errors.Is(err, errCorruptFrame) && !errors.Is(err, io.EOF) {
 		t.Fatalf("partial tail: got %v, want corrupt or EOF", err)
 	}
@@ -101,7 +101,7 @@ func TestReadFrame_PartialTail(t *testing.T) {
 func TestReadFrame_HugeLengthRejected(t *testing.T) {
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], maxFramePayload+1)
-	_, _, err := readFrame(bytes.NewReader(hdr[:]), nil)
+	_, _, err := readFrame(bytes.NewReader(hdr[:]), nil, "", "", 1)
 	if !errors.Is(err, errCorruptFrame) {
 		t.Fatalf("huge length: got %v, want errCorruptFrame", err)
 	}
@@ -129,7 +129,7 @@ func TestLoadJournal_CacheAndSignals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cache, signals, err := loadJournal(dir, taskID, runID, nil, nil)
+	cache, signals, err := loadJournal(dir, taskID, runID, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestLoadJournal_RunningStatusExcludedFromCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cache, _, err := loadJournal(dir, taskID, runID, nil, nil)
+	cache, _, err := loadJournal(dir, taskID, runID, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestLoadStepEvents_IncludesRunningInOrderWithOffsets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := loadStepEvents(dir, taskID, runID, nil, nil)
+	events, err := loadStepEvents(dir, taskID, runID, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestJournalTail_ReflectsExistingFrames(t *testing.T) {
 	}
 	e.closeJournal(taskID, runID)
 
-	count, size, err := journalTail(dir, taskID, runID, nil)
+	count, size, err := journalTail(dir, taskID, runID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,12 +264,166 @@ func TestLoadJournal_PartialTailStopsReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cache, _, err := loadJournal(dir, taskID, runID, nil, nil)
+	cache, _, err := loadJournal(dir, taskID, runID, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("partial tail must not fail load: %v", err)
 	}
 	if cache["good"].Status != StepStatusCompleted {
 		t.Fatalf("expected intact prefix, got %+v", cache)
+	}
+}
+
+// A torn write must not strand every later append behind it: the frames
+// after the tear are unreachable to replay, so the tear has to be cut off
+// before the journal is reopened for append.
+func TestGetOrOpenJournal_DiscardsTornTailBeforeAppending(t *testing.T) {
+	dir := t.TempDir()
+	taskID, runID := "t1", "r1"
+	e := &Engine{dataDir: dir}
+	if err := e.appendStep(taskID, runID, StepRecord{
+		StepID: "first", Status: StepStatusCompleted, Result: []byte(`"1"`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.closeJournal(taskID, runID)
+
+	path := journalPath(dir, taskID, runID)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A frame header claiming 0x40 payload bytes, with only two of them on disk.
+	if _, err := f.Write([]byte{0x00, 0x00, 0x00, 0x40, 0xde, 0xad}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.appendStep(taskID, runID, StepRecord{
+		StepID: "second", Status: StepStatusCompleted, Result: []byte(`"2"`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cache, _, err := loadJournal(dir, taskID, runID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cache["first"].Status != StepStatusCompleted {
+		t.Fatalf("lost the frame before the tear: %+v", cache)
+	}
+	if cache["second"].Status != StepStatusCompleted {
+		t.Fatalf("append after a torn tail is unreachable to replay: %+v", cache)
+	}
+
+	// The cached handle's byte position must match the file, or the
+	// ByteOffset handed to WatchSteps stops lining up with the journal.
+	h, err := e.getOrOpenJournal(taskID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.size != st.Size() {
+		t.Fatalf("handle size %d, file size %d", h.size, st.Size())
+	}
+	e.closeJournal(taskID, runID)
+}
+
+// A payload readFrame would reject must fail the append instead of writing a
+// frame that replay and compaction cannot read past.
+func TestAppendStep_RejectsOversizePayload(t *testing.T) {
+	dir := t.TempDir()
+	e := &Engine{dataDir: dir}
+	huge := make([]byte, maxFramePayload+1)
+	for i := range huge {
+		huge[i] = 'x'
+	}
+	err := e.appendStep("t1", "r1", StepRecord{
+		StepID: "big", Status: StepStatusCompleted, Result: huge,
+	})
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("got %v, want ErrPayloadTooLarge", err)
+	}
+	cache, loadErr := func() (map[string]StepRecord, error) {
+		c, _, err := loadJournal(dir, "t1", "r1", nil, nil, nil)
+		return c, err
+	}()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(cache) != 0 {
+		t.Fatalf("rejected frame was still persisted: %+v", cache)
+	}
+}
+
+// Corruption with intact frames after it is real damage, not an interrupted
+// write. Stopping there silently would discard every later step.
+func TestLoadJournal_InteriorCorruptionFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	taskID, runID := "t1", "r1"
+	e := &Engine{dataDir: dir}
+	for _, id := range []string{"a", "b", "c"} {
+		if err := e.appendStep(taskID, runID, StepRecord{
+			StepID: id, Status: StepStatusCompleted, Result: []byte(`"x"`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.closeJournal(taskID, runID)
+
+	path := journalPath(dir, taskID, runID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[frameLenSize+1] ^= 0xff // inside the first frame's payload
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := loadJournal(dir, taskID, runID, nil, nil, nil); !errors.Is(err, errCorruptInterior) {
+		t.Fatalf("got %v, want errCorruptInterior", err)
+	}
+}
+
+// The tail stays lenient: a corrupt final frame is what a crash mid-append
+// looks like, so the intact prefix must still replay.
+func TestLoadJournal_CorruptFinalFrameStillRecovers(t *testing.T) {
+	dir := t.TempDir()
+	taskID, runID := "t1", "r1"
+	e := &Engine{dataDir: dir}
+	for _, id := range []string{"a", "b"} {
+		if err := e.appendStep(taskID, runID, StepRecord{
+			StepID: id, Status: StepStatusCompleted, Result: []byte(`"x"`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.closeJournal(taskID, runID)
+
+	path := journalPath(dir, taskID, runID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)-1] ^= 0xff // last frame's CRC trailer
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cache, _, err := loadJournal(dir, taskID, runID, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("corrupt final frame must not fail replay: %v", err)
+	}
+	if cache["a"].Status != StepStatusCompleted {
+		t.Fatalf("intact prefix lost: %+v", cache)
+	}
+	if _, ok := cache["b"]; ok {
+		t.Fatalf("corrupt final frame must be discarded: %+v", cache)
 	}
 }
 
@@ -295,7 +449,7 @@ func TestCompactJournal_PreservesLatestStepAndAllSignals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	steps, sigs, err := readJournalFrames(dir, taskID, runID, nil)
+	steps, sigs, err := readJournalFrames(dir, taskID, runID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +479,7 @@ func TestCompactJournal_DropsRunningEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := loadStepEvents(dir, taskID, runID, nil, nil)
+	events, err := loadStepEvents(dir, taskID, runID, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +490,7 @@ func TestCompactJournal_DropsRunningEntries(t *testing.T) {
 
 func TestMakeFrame_CRCMatchesPayload(t *testing.T) {
 	payload := []byte("hello")
-	frame := makeFrame(payload, nil)
+	frame := makeFrame(payload, nil, "", "", 1)
 	if int(binary.BigEndian.Uint32(frame[:4])) != len(payload) {
 		t.Fatal("length prefix mismatch")
 	}
@@ -357,11 +511,11 @@ func TestMakeReadFrame_HMACRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := makeFrame(payload, key)
+	frame := makeFrame(payload, key, "t", "r", 1)
 	if len(frame) != frameLenSize+len(payload)+frameHMACSize {
 		t.Fatalf("frame len %d", len(frame))
 	}
-	got, size, err := readFrame(bytes.NewReader(frame), key)
+	got, size, err := readFrame(bytes.NewReader(frame), key, "t", "r", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,16 +536,41 @@ func TestReadFrame_HMACMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := makeFrame(payload, key)
+	frame := makeFrame(payload, key, "t", "r", 1)
 	frame[4] ^= 0xff
-	_, _, err = readFrame(bytes.NewReader(frame), key)
+	_, _, err = readFrame(bytes.NewReader(frame), key, "t", "r", 1)
 	if !errors.Is(err, errJournalMAC) {
 		t.Fatalf("got %v, want errJournalMAC", err)
 	}
 
-	_, _, err = readFrame(bytes.NewReader(frame), []byte("other-key"))
+	_, _, err = readFrame(bytes.NewReader(frame), []byte("other-key"), "t", "r", 1)
 	if !errors.Is(err, errJournalMAC) {
 		t.Fatalf("wrong key: got %v, want errJournalMAC", err)
+	}
+}
+
+func TestReadFrame_HMACBoundToTaskRunAndIndex(t *testing.T) {
+	key := []byte("journal-mac-key")
+	entry := &durablepb.JournalEntry{
+		Entry: &durablepb.JournalEntry_Step{Step: stepToProto(StepRecord{StepID: "a", Status: StepStatusCompleted, Result: []byte(`"ok"`)})},
+	}
+	payload, err := proto.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := makeFrame(payload, key, "task-a", "run-a", 1)
+
+	if _, _, err := readFrame(bytes.NewReader(frame), key, "task-b", "run-a", 1); !errors.Is(err, errJournalMAC) {
+		t.Fatalf("copied to another task: got %v, want errJournalMAC", err)
+	}
+	if _, _, err := readFrame(bytes.NewReader(frame), key, "task-a", "run-b", 1); !errors.Is(err, errJournalMAC) {
+		t.Fatalf("copied to another run: got %v, want errJournalMAC", err)
+	}
+	if _, _, err := readFrame(bytes.NewReader(frame), key, "task-a", "run-a", 2); !errors.Is(err, errJournalMAC) {
+		t.Fatalf("reordered index: got %v, want errJournalMAC", err)
+	}
+	if _, _, err := readFrame(bytes.NewReader(frame), key, "task-a", "run-a", 1); err != nil {
+		t.Fatalf("matching location: %v", err)
 	}
 }
 

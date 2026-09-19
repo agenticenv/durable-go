@@ -11,6 +11,7 @@ import (
 	"time"
 
 	durable "github.com/agenticenv/durable-go"
+	"github.com/agenticenv/durable-go/examples/internal/exdir"
 )
 
 type OrderInput struct {
@@ -74,7 +75,7 @@ var processOrder = durable.Func(func(ctx context.Context, s *durable.StepRunner,
 func main() {
 	ctx := context.Background()
 
-	e, err := durable.NewEngine(ctx, "examples/fanout/.data/fanout-journal")
+	e, err := durable.NewEngine(ctx, exdir.Data("fanout", "fanout-journal"))
 	if err != nil {
 		log.Fatal(err)
 	}

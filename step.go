@@ -578,6 +578,16 @@ func CompleteStep[O any](ctx context.Context, e *Engine, token string, result O)
 	if err != nil {
 		return err
 	}
+	// A token is caller-supplied data, so its IDs get the same path-safety
+	// check CancelRun applies to its arguments. Without this a forged token
+	// could put ".." in either field and steer loadMeta and appendSignal at a
+	// directory outside dataDir.
+	if err := validateTaskID(taskID); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidToken, err)
+	}
+	if err := validateRunID(runID); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidToken, err)
+	}
 
 	mu := e.lockSignal(taskID, runID, stepID)
 	defer mu.Unlock()

@@ -14,5 +14,5 @@ go run .
 ## Reset
 
 ```bash
-rm -rf examples/func-task/.data/
+rm -rf .data/
 ```

@@ -2,7 +2,7 @@
 // AES-GCM, a reversible custom codec, HMAC step tokens, journal MAC, then
 // inspect hints.
 //
-//	go run ./examples/payload-codec/
+//	go run .
 package main
 
 import (
@@ -18,10 +18,11 @@ import (
 	"time"
 
 	durable "github.com/agenticenv/durable-go"
+	"github.com/agenticenv/durable-go/examples/internal/exdir"
 )
 
 const (
-	demoPayloadKeyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	demoPayloadKeyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff" // gitleaks:allow demo key, not a secret
 	demoPrefix        = "DEMO:"
 	echoTaskID        = "echo"
 	echoRunID         = "run-1"
@@ -117,10 +118,7 @@ func main() {
 }
 
 func journalDir(name string) string {
-	if _, err := os.Stat("examples/payload-codec"); err == nil {
-		return filepath.Join("examples/payload-codec/.data", name)
-	}
-	return filepath.Join(".data", name)
+	return exdir.Data("payload-codec", name)
 }
 
 func payloadKey() []byte {

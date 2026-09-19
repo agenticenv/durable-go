@@ -133,7 +133,7 @@ func TestAppendStep_EncodesAndLoadJournalDecodes(t *testing.T) {
 	}
 	e.closeJournal("t", "r")
 
-	rawSteps, _, err := readJournalFrames(dir, "t", "r", nil)
+	rawSteps, _, err := readJournalFrames(dir, "t", "r", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestAppendStep_EncodesAndLoadJournalDecodes(t *testing.T) {
 		t.Fatalf("disk result %q", rawSteps["echo"].Result)
 	}
 
-	steps, _, err := loadJournal(dir, "t", "r", e.codec(), nil)
+	steps, _, err := loadJournal(dir, "t", "r", e.codec(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestAppendStep_EncodesAndLoadJournalDecodes(t *testing.T) {
 		t.Fatalf("decoded %+v", steps["echo"])
 	}
 
-	if _, _, err := loadJournal(dir, "t", "r", prefixCodec{p: "NOPE:"}, nil); err == nil {
+	if _, _, err := loadJournal(dir, "t", "r", prefixCodec{p: "NOPE:"}, nil, nil); err == nil {
 		t.Fatal("expected fail-closed decode")
 	}
 }
@@ -162,7 +162,7 @@ func TestAppendSignal_EncodesAndLoadJournalDecodes(t *testing.T) {
 	}
 	e.closeJournal("t", "r")
 
-	_, sigs, err := readJournalFrames(dir, "t", "r", nil)
+	_, sigs, err := readJournalFrames(dir, "t", "r", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestAppendSignal_EncodesAndLoadJournalDecodes(t *testing.T) {
 		t.Fatalf("disk signal %+v", sigs)
 	}
 
-	_, payloads, err := loadJournal(dir, "t", "r", e.codec(), nil)
+	_, payloads, err := loadJournal(dir, "t", "r", e.codec(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestCompactJournal_CopiesCiphertextAsIs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	steps, sigs, err := readJournalFrames(dir, "t", "r", nil)
+	steps, sigs, err := readJournalFrames(dir, "t", "r", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestCompactJournal_CopiesCiphertextAsIs(t *testing.T) {
 		t.Fatalf("compact signal %+v", sigs)
 	}
 
-	decoded, payloads, err := loadJournal(dir, "t", "r", e.codec(), nil)
+	decoded, payloads, err := loadJournal(dir, "t", "r", e.codec(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +398,7 @@ func TestPayloadCodec_CompleteStep(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	codec := prefixCodec{p: "ENC:"}
-	e, err := NewEngine(ctx, dir, WithPayloadCodec(codec))
+	e, err := NewEngine(ctx, dir, WithPayloadCodec(codec), WithUnsignedStepTokens())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,5 +547,48 @@ func TestAESGCMCodec_EnginePersistsCiphertext(t *testing.T) {
 	}
 	if execs.Load() != 1 {
 		t.Fatalf("step re-ran on replay: %d", execs.Load())
+	}
+}
+
+func TestAESGCMCodecWithKeys_RotatesAndReadsPrevious(t *testing.T) {
+	oldKey := bytes.Repeat([]byte{1}, 32)
+	newKey := bytes.Repeat([]byte{2}, 32)
+	old, err := NewAESGCMCodec(oldKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aad := payloadAAD(aadKindTaskInput, "t", "r", "")
+	legacy, err := old.Encode([]byte("legacy"), aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy[0] != aesgcmVersion {
+		t.Fatalf("v1 envelope %02x", legacy[0])
+	}
+
+	rotated, err := NewAESGCMCodecWithKeys(
+		AESGCMKey{ID: 1, Key: newKey},
+		AESGCMKey{ID: 0, Key: oldKey},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := rotated.Decode(legacy, aad)
+	if err != nil || string(got) != "legacy" {
+		t.Fatalf("dual-key read of v1: %q %v", got, err)
+	}
+	fresh, err := rotated.Encode([]byte("fresh"), aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh[0] != aesgcmVersionID || fresh[1] != 1 {
+		t.Fatalf("v2 envelope %02x id=%d", fresh[0], fresh[1])
+	}
+	got, err = rotated.Decode(fresh, aad)
+	if err != nil || string(got) != "fresh" {
+		t.Fatalf("v2 round-trip %q %v", got, err)
+	}
+	if _, err := old.Decode(fresh, aad); err == nil {
+		t.Fatal("v1-only codec should not read v2 with a different key id")
 	}
 }

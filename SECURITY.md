@@ -42,11 +42,13 @@ The engine writes `meta.json`, `input.json`, `journal.log`, and `output.json` un
 
 ### Step tokens
 
-`CompleteStep` tokens are unsigned with no expiry unless `WithStepTokenKey` is set. With a key, tokens are HMAC-SHA256 with a default 24h TTL (`WithDefaultStepTokenTTL`, per-step `WithStepTokenTTL`). The key is not stored in `dataDir`. Unsigned tokens are rejected when a key is configured. `CancelRun`'s internal signal is not a user token.
+`CompleteStep` tokens are HMAC-SHA256 by default (process-ephemeral key, 24h TTL via `WithDefaultStepTokenTTL` / `WithStepTokenTTL`). Persist a key with `WithStepTokenKey` so tokens survive a restart. `WithUnsignedStepTokens` opts out — anyone who can reach `CompleteStep` can then mint a token for any run. The key is not stored in `dataDir`. Unsigned tokens are rejected when a key is configured. `CancelRun`'s internal signal is not a user token.
 
 ### Journal frames
 
-Default `journal.log` frames use a CRC32 trailer (crash/torn-write detection). CRC is not authentication: anyone who can edit the file can change a cached step result and recompute the CRC. `WithJournalMACKey` replaces the trailer with HMAC-SHA256 and signs `input.json` / `output.json` / `meta.json` (32-byte trailer, bound to task/run; key not stored in `dataDir`). Resume fail-closes on a MAC mismatch. Truncating or deleting files is still possible; missing steps may re-run. Do not enable a journal MAC on an existing unsigned tree; open a second `NewEngine` on a new `dataDir` or wipe the old one.
+Default `journal.log` frames use a CRC32 trailer (crash/torn-write detection). CRC is not authentication: anyone who can edit the file can change a cached step result and recompute the CRC. `WithJournalMACKey` replaces the trailer with HMAC-SHA256 bound to taskID, runID, and the 1-based frame index (journal v2) and signs `input.json` / `output.json` / `meta.json` (32-byte trailer, bound to task/run; key not stored in `dataDir`). A copied or reordered journal fails closed. Resume fail-closes on a MAC mismatch. Truncating or deleting files is still possible; missing steps may re-run. Do not enable a journal MAC on an existing unsigned tree; open a second `NewEngine` on a new `dataDir` or wipe the old one.
+
+`NewAESGCMCodec` writes v1 (`version | nonce | sealed`). `NewAESGCMCodecWithKeys` writes v2 with a key ID and can keep the previous key in a dual-key read window. Rotate before `AESGCMRekeyAfter` (~2^32) random-nonce seals per key.
 
 ### Inspect
 
@@ -61,4 +63,4 @@ Monitor via **Dependabot** (`.github/dependabot.yml`) and **`govulncheck`** (`ta
 - Callers' application logic inside task or step closures
 - External services invoked from user steps
 - General usage questions
-- Encrypting `Error` / `PanicTrace`, key rotation, and secure wipe on purge
+- Encrypting `Error` / `PanicTrace` and secure wipe on purge

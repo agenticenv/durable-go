@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,12 +29,16 @@ import (
 // loss so replay can stop at the last intact frame. HMAC also detects
 // that, and rejects an editor who rewrites the protobuf and recomputes CRC32.
 const (
-	frameLenSize        = 4
-	frameCRCSize        = 4
-	frameHMACSize       = sha256.Size
-	frameOverhead       = frameLenSize + frameCRCSize // default (CRC) overhead
-	maxFramePayload     = 32 << 20                    // 32 MiB — reject corrupt lengths that would OOM
-	journalMACDomain    = "durable.journal.v1"
+	frameLenSize    = 4
+	frameCRCSize    = 4
+	frameHMACSize   = sha256.Size
+	frameOverhead   = frameLenSize + frameCRCSize // default (CRC) overhead
+	maxFramePayload = 32 << 20                    // 32 MiB — reject corrupt lengths that would OOM
+	// v2 binds each frame MAC to taskID, runID, and the 1-based frame
+	// index so a journal.log cannot be copied between runs or have its
+	// frames reordered/duplicated. v1 (domain + length + payload only)
+	// is not read back — enabling a journal MAC is not a migrate.
+	journalMACDomain    = "durable.journal.v2"
 	fileMACDomainMeta   = "durable.meta.v1"
 	fileMACDomainInput  = "durable.input.v1"
 	fileMACDomainOutput = "durable.output.v1"
@@ -40,9 +46,27 @@ const (
 
 var (
 	errCorruptFrame = errors.New("durable: corrupt or truncated journal frame")
-	errJournalMAC   = errors.New("durable: journal MAC mismatch")
-	errFileMAC      = errors.New("durable: file MAC mismatch")
+	// errTruncatedFrame is the subset of errCorruptFrame where the file ended
+	// part-way through a frame. That can only happen at the tail, so it is
+	// always recoverable — unlike a frame that decodes badly while intact
+	// frames follow it.
+	errTruncatedFrame = fmt.Errorf("%w (file ended mid-frame)", errCorruptFrame)
+	errJournalMAC     = errors.New("durable: journal MAC mismatch")
+	errFileMAC        = errors.New("durable: file MAC mismatch")
+	// errCorruptInterior is returned when an undecodable frame is followed by
+	// more bytes. Treating that as end-of-journal would silently discard every
+	// step after it, so replay fails closed instead.
+	errCorruptInterior = errors.New("durable: corrupt journal frame with data after it")
 )
+
+// orDiscard makes a logger optional at every call site. Internal tests build
+// a bare &Engine{dataDir: ...} with no logger configured.
+func orDiscard(l *slog.Logger) *slog.Logger {
+	if l == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return l
+}
 
 // journalFile is a cached append handle. CompleteStep writes SignalEntry
 // without holding runLocks (the waiter already holds that lock), so each
@@ -78,11 +102,11 @@ func (e *Engine) resolveRunInput(taskID, runID string, caller []byte) ([]byte, e
 }
 
 func (e *Engine) loadJournal(taskID, runID string) (map[string]StepRecord, map[string][]byte, error) {
-	return loadJournal(e.dataDir, taskID, runID, e.codec(), e.journalMACKey())
+	return loadJournal(e.dataDir, taskID, runID, e.codec(), e.journalMACKey(), e.log())
 }
 
 func (e *Engine) loadStepEvents(taskID, runID string) ([]StepEvent, error) {
-	return loadStepEvents(e.dataDir, taskID, runID, e.codec(), e.journalMACKey())
+	return loadStepEvents(e.dataDir, taskID, runID, e.codec(), e.journalMACKey(), e.log())
 }
 
 func (e *Engine) scanRuns(taskID string) ([]string, error) {
@@ -293,8 +317,13 @@ func (e *Engine) appendFrame(taskID, runID string, entry *durablepb.JournalEntry
 	if err != nil {
 		return 0, 0, fmt.Errorf("marshal journal entry: %w", err)
 	}
-	frame := makeFrame(payload, e.journalMACKey())
-
+	// Refuse a payload readFrame would later reject. Writing one succeeds at
+	// the OS level but makes the frame — and everything appended after it —
+	// unreadable on replay and in compaction, so the step must fail here
+	// instead.
+	if err := checkFramePayload(payload); err != nil {
+		return 0, 0, err
+	}
 	h, err := e.getOrOpenJournal(taskID, runID)
 	if err != nil {
 		return 0, 0, err
@@ -302,19 +331,47 @@ func (e *Engine) appendFrame(taskID, runID string, entry *durablepb.JournalEntry
 	key := taskID + "/" + runID
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	frame := makeFrame(payload, e.journalMACKey(), taskID, runID, h.count+1)
 	if _, err := h.f.Write(frame); err != nil {
-		_ = h.f.Close()
-		e.openFiles.Delete(key)
+		e.discardTornFrame(h, taskID, runID, key)
 		return 0, 0, fmt.Errorf("write frame: %w", err)
 	}
 	if err := h.f.Sync(); err != nil {
-		_ = h.f.Close()
-		e.openFiles.Delete(key)
+		e.discardTornFrame(h, taskID, runID, key)
 		return 0, 0, fmt.Errorf("sync journal: %w", err)
 	}
 	h.count++
 	h.size += int64(len(frame))
 	return h.count, h.size, nil
+}
+
+// checkFramePayload rejects a payload that would not survive a round trip:
+// readFrame refuses anything over maxFramePayload, and the 4-byte length
+// prefix cannot describe more than a uint32 in the first place.
+func checkFramePayload(payload []byte) error {
+	if len(payload) > maxFramePayload {
+		return fmt.Errorf("%w: journal frame payload is %d bytes, limit is %d",
+			ErrPayloadTooLarge, len(payload), maxFramePayload)
+	}
+	return nil
+}
+
+// discardTornFrame rolls the journal back to the last fully written frame
+// after a failed append, then drops the cached handle. Leaving the partial
+// bytes in place would strand every later append behind a frame that replay
+// cannot read past — the appends would keep succeeding while resume silently
+// lost all of them. Caller holds h.mu.
+func (e *Engine) discardTornFrame(h *journalFile, taskID, runID, key string) {
+	if err := h.f.Truncate(h.size); err != nil {
+		orDiscard(e.log()).Error("journal rollback failed after a torn append",
+			"task_id", taskID, "run_id", runID, "last_good_offset", h.size, "error", err)
+	} else {
+		_ = h.f.Sync()
+	}
+	_ = h.f.Close()
+	if _, loaded := e.openFiles.LoadAndDelete(key); loaded {
+		e.openCount.Add(-1)
+	}
 }
 
 func (e *Engine) getOrOpenJournal(taskID, runID string) (*journalFile, error) {
@@ -325,7 +382,7 @@ func (e *Engine) getOrOpenJournal(taskID, runID string) (*journalFile, error) {
 	if err := mkdirAllSecure(e.runDir(taskID, runID)); err != nil {
 		return nil, fmt.Errorf("create run dir: %w", err)
 	}
-	count, size, err := journalTail(e.dataDir, taskID, runID, e.journalMACKey())
+	count, size, err := journalTail(e.dataDir, taskID, runID, e.journalMACKey(), e.log())
 	if err != nil {
 		return nil, fmt.Errorf("scan journal tail: %w", err)
 	}
@@ -334,6 +391,17 @@ func (e *Engine) getOrOpenJournal(taskID, runID string) (*journalFile, error) {
 	created := errors.Is(statErr, os.ErrNotExist)
 	if statErr != nil && !created {
 		return nil, fmt.Errorf("stat journal: %w", statErr)
+	}
+	// Drop anything past the last intact frame before reopening for append.
+	// journalTail stops at a torn tail, so without this the next O_APPEND
+	// write would land after bytes replay can never read past: every later
+	// frame would be persisted and then silently lost on resume, and h.size
+	// would drift from the real file size so WatchSteps byte offsets stop
+	// matching the file.
+	if !created {
+		if err := truncateJournalTo(path, size, taskID, runID, e.log()); err != nil {
+			return nil, err
+		}
 	}
 	f, err := openFileSecure(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY)
 	if err != nil {
@@ -345,14 +413,51 @@ func (e *Engine) getOrOpenJournal(taskID, runID string) (*journalFile, error) {
 		_ = f.Close()
 		return actual.(*journalFile), nil
 	}
+	e.openCount.Add(1)
+	e.evictOpenJournals(key)
 	if created {
 		if err := syncDirFn(filepath.Dir(path)); err != nil {
 			e.openFiles.Delete(key)
+			e.openCount.Add(-1)
 			_ = f.Close()
 			return nil, fmt.Errorf("sync journal dir: %w", err)
 		}
 	}
 	return h, nil
+}
+
+// truncateJournalTo drops everything past keep bytes and fsyncs, so the next
+// O_APPEND write lands exactly where replay stops reading. A no-op when the
+// file is already that size, which is the common case.
+func truncateJournalTo(path string, keep int64, taskID, runID string, logger *slog.Logger) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("durable: stat journal %s/%s: %w", taskID, runID, err)
+	}
+	if st.Size() <= keep {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, filePerm)
+	if err != nil {
+		return fmt.Errorf("durable: open journal %s/%s to truncate: %w", taskID, runID, err)
+	}
+	err = f.Truncate(keep)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("durable: truncate journal %s/%s: %w", taskID, runID, err)
+	}
+	orDiscard(logger).Warn("journal rolled back to last intact frame",
+		"task_id", taskID, "run_id", runID,
+		"kept_bytes", keep, "discarded_bytes", st.Size()-keep)
+	return nil
 }
 
 func (e *Engine) closeJournal(taskID, runID string) {
@@ -362,6 +467,7 @@ func (e *Engine) closeJournal(taskID, runID string) {
 		h.mu.Lock()
 		_ = h.f.Close()
 		h.mu.Unlock()
+		e.openCount.Add(-1)
 	}
 }
 
@@ -372,6 +478,28 @@ func (e *Engine) closeAllJournals() {
 		_ = h.f.Close()
 		h.mu.Unlock()
 		e.openFiles.Delete(key)
+		return true
+	})
+	e.openCount.Store(0)
+}
+
+func (e *Engine) evictOpenJournals(keep string) {
+	if e.openCount.Load() <= maxOpenJournals {
+		return
+	}
+	e.openFiles.Range(func(key, _ any) bool {
+		if e.openCount.Load() <= maxOpenJournals {
+			return false
+		}
+		k, ok := key.(string)
+		if !ok || k == keep {
+			return true
+		}
+		taskID, runID, ok := strings.Cut(k, "/")
+		if !ok {
+			return true
+		}
+		e.closeJournal(taskID, runID)
 		return true
 	})
 }
@@ -385,49 +513,80 @@ type frameVisit struct {
 	entry      *durablepb.JournalEntry
 }
 
+// journalRecovery reports what a scan discarded at the tail of the journal.
+// Zero means the file ended cleanly on a frame boundary.
+type journalRecovery struct {
+	frames int
+	bytes  int64
+}
+
 // scanJournal opens the journal (a no-op if it does not exist yet) and
-// calls visit for every intact frame in append order. A torn or
-// CRC-mismatched tail stops the scan without error so a crash mid-append
-// cannot poison replay or resume.
-func scanJournal(dataDir, taskID, runID string, macKey []byte, visit func(frameVisit)) error {
+// calls visit for every intact frame in append order.
+//
+// A torn tail stops the scan without error so a crash mid-append cannot
+// poison replay or resume, and what was dropped is logged. That leniency is
+// deliberately limited to the tail: a frame that fails to decode while
+// intact bytes still follow it is real damage, not an interrupted write, and
+// silently stopping there would discard every step after it. That case
+// returns errCorruptInterior instead. An HMAC mismatch always fails closed
+// (tamper or wrong key), wherever it occurs.
+func scanJournal(dataDir, taskID, runID string, macKey []byte, logger *slog.Logger, visit func(frameVisit)) (journalRecovery, error) {
 	path := journalPath(dataDir, taskID, runID)
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return journalRecovery{}, nil
 	}
 	if err != nil {
-		return fmt.Errorf("durable: open journal %s/%s: %w", taskID, runID, err)
+		return journalRecovery{}, fmt.Errorf("durable: open journal %s/%s: %w", taskID, runID, err)
 	}
 	defer func() { _ = f.Close() }()
+
+	st, err := f.Stat()
+	if err != nil {
+		return journalRecovery{}, fmt.Errorf("durable: stat journal %s/%s: %w", taskID, runID, err)
+	}
+	size := st.Size()
 
 	var idx int
 	var offset int64
 	for {
-		entry, frameLen, err := readFrame(f, macKey)
-		if err != nil {
-			// io.EOF is a clean end. Corrupt/truncated tail is also treated
-			// as end-of-valid-data so a kill -9 mid-write cannot fail resume.
-			// HMAC mismatch is fail-closed (tamper or wrong key).
-			if errors.Is(err, io.EOF) || errors.Is(err, errCorruptFrame) {
-				break
-			}
-			return fmt.Errorf("durable: read journal %s/%s: %w", taskID, runID, err)
+		entry, frameLen, err := readFrame(f, macKey, taskID, runID, idx+1)
+		if err == nil {
+			idx++
+			offset += frameLen
+			visit(frameVisit{index: idx, byteOffset: offset, entry: entry})
+			continue
 		}
-		idx++
-		offset += frameLen
-		visit(frameVisit{index: idx, byteOffset: offset, entry: entry})
+		if errors.Is(err, io.EOF) {
+			return journalRecovery{}, nil
+		}
+		if !errors.Is(err, errCorruptFrame) {
+			return journalRecovery{}, fmt.Errorf("durable: read journal %s/%s: %w", taskID, runID, err)
+		}
+		// Recoverable only when nothing intact can follow: either the file
+		// ended mid-frame, or the frame's own claimed length runs to or past
+		// EOF. Anything else has readable bytes after it.
+		if !errors.Is(err, errTruncatedFrame) && offset+frameLen < size {
+			return journalRecovery{}, fmt.Errorf("durable: read journal %s/%s at byte %d: %w",
+				taskID, runID, offset, errCorruptInterior)
+		}
+		rec := journalRecovery{frames: 1, bytes: size - offset}
+		orDiscard(logger).Warn("journal tail discarded: torn final frame",
+			"task_id", taskID, "run_id", runID,
+			"last_good_offset", offset, "discarded_bytes", rec.bytes)
+		return rec, nil
 	}
-	return nil
 }
 
 // journalTail scans the whole journal purely to find the current frame
 // count and byte size, used to seed a freshly opened journalFile handle so
 // appendFrame can report correct Offset/ByteOffset without rescanning on
-// every write.
-func journalTail(dataDir, taskID, runID string, macKey []byte) (int, int64, error) {
+// every write. size is the offset of the last intact frame's end, which is
+// also where a torn tail must be truncated back to.
+func journalTail(dataDir, taskID, runID string, macKey []byte, logger *slog.Logger) (int, int64, error) {
 	var count int
 	var size int64
-	err := scanJournal(dataDir, taskID, runID, macKey, func(v frameVisit) {
+	_, err := scanJournal(dataDir, taskID, runID, macKey, logger, func(v frameVisit) {
 		count = v.index
 		size = v.byteOffset
 	})
@@ -440,8 +599,8 @@ func journalTail(dataDir, taskID, runID string, macKey []byte) (int, int64, erro
 // step with no later WAITING/COMPLETED/FAILED record is treated as missing
 // on replay, so RunStep re-runs fn rather than getting stuck. A torn or
 // CRC-mismatched tail is discarded so a crash mid-append cannot poison replay.
-func loadJournal(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) (map[string]StepRecord, map[string][]byte, error) {
-	steps, sigs, err := readJournalFrames(dataDir, taskID, runID, macKey)
+func loadJournal(dataDir, taskID, runID string, c PayloadCodec, macKey []byte, logger *slog.Logger) (map[string]StepRecord, map[string][]byte, error) {
+	steps, sigs, err := readJournalFrames(dataDir, taskID, runID, macKey, logger)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -464,10 +623,10 @@ func loadJournal(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) (
 	return steps, payloads, nil
 }
 
-func readJournalFrames(dataDir, taskID, runID string, macKey []byte) (map[string]StepRecord, []*durablepb.SignalEntry, error) {
+func readJournalFrames(dataDir, taskID, runID string, macKey []byte, logger *slog.Logger) (map[string]StepRecord, []*durablepb.SignalEntry, error) {
 	steps := make(map[string]StepRecord)
 	var signals []*durablepb.SignalEntry
-	err := scanJournal(dataDir, taskID, runID, macKey, func(v frameVisit) {
+	_, err := scanJournal(dataDir, taskID, runID, macKey, logger, func(v frameVisit) {
 		switch e := v.entry.Entry.(type) {
 		case *durablepb.JournalEntry_Step:
 			if e.Step == nil {
@@ -495,9 +654,9 @@ func readJournalFrames(dataDir, taskID, runID string, macKey []byte) (map[string
 // never last-write-wins. Offset and ByteOffset match what appendFrame
 // reported when each frame was written (SignalEntry frames advance the
 // shared counters but are not emitted here).
-func loadStepEvents(dataDir, taskID, runID string, c PayloadCodec, macKey []byte) ([]StepEvent, error) {
+func loadStepEvents(dataDir, taskID, runID string, c PayloadCodec, macKey []byte, logger *slog.Logger) ([]StepEvent, error) {
 	var events []StepEvent
-	err := scanJournal(dataDir, taskID, runID, macKey, func(v frameVisit) {
+	_, err := scanJournal(dataDir, taskID, runID, macKey, logger, func(v frameVisit) {
 		step, ok := v.entry.Entry.(*durablepb.JournalEntry_Step)
 		if !ok || step.Step == nil {
 			return
@@ -511,12 +670,17 @@ func loadStepEvents(dataDir, taskID, runID string, c PayloadCodec, macKey []byte
 	if err != nil {
 		return nil, err
 	}
+	info, _, metaErr := loadMeta(dataDir, taskID, runID, macKey)
+	if metaErr != nil {
+		return nil, metaErr
+	}
 	for i, ev := range events {
 		decoded, err := decodeStepRecord(c, taskID, runID, ev.StepRecord)
 		if err != nil {
 			return nil, fmt.Errorf("durable: decode step event %s/%s/%s: %w", taskID, runID, ev.StepID, err)
 		}
 		events[i].StepRecord = decoded
+		events[i].Generation = info.JournalGeneration
 	}
 	return events, nil
 }
@@ -528,12 +692,13 @@ func loadStepEvents(dataDir, taskID, runID string, c PayloadCodec, macKey []byte
 // signals are an audit of external completions and must not be collapsed
 // away. Order is not preserved or sorted; only the map's current state matters.
 func (e *Engine) compactJournal(taskID, runID string) error {
-	steps, signals, err := readJournalFrames(e.dataDir, taskID, runID, e.journalMACKey())
+	steps, signals, err := readJournalFrames(e.dataDir, taskID, runID, e.journalMACKey(), e.log())
 	if err != nil {
 		return fmt.Errorf("durable: compact read %s/%s: %w", taskID, runID, err)
 	}
 
 	var buf []byte
+	var idx int
 	for _, rec := range steps {
 		entry := &durablepb.JournalEntry{
 			Entry: &durablepb.JournalEntry_Step{Step: stepToProto(rec)},
@@ -542,7 +707,11 @@ func (e *Engine) compactJournal(taskID, runID string) error {
 		if err != nil {
 			return fmt.Errorf("durable: compact marshal step %s/%s: %w", taskID, runID, err)
 		}
-		buf = append(buf, makeFrame(payload, e.journalMACKey())...)
+		if err := checkFramePayload(payload); err != nil {
+			return fmt.Errorf("durable: compact step %s/%s/%s: %w", taskID, runID, rec.StepID, err)
+		}
+		idx++
+		buf = append(buf, makeFrame(payload, e.journalMACKey(), taskID, runID, idx)...)
 	}
 	for _, sig := range signals {
 		entry := &durablepb.JournalEntry{
@@ -552,12 +721,23 @@ func (e *Engine) compactJournal(taskID, runID string) error {
 		if err != nil {
 			return fmt.Errorf("durable: compact marshal signal %s/%s: %w", taskID, runID, err)
 		}
-		buf = append(buf, makeFrame(payload, e.journalMACKey())...)
+		if err := checkFramePayload(payload); err != nil {
+			return fmt.Errorf("durable: compact signal %s/%s/%s: %w", taskID, runID, sig.GetSignalId(), err)
+		}
+		idx++
+		buf = append(buf, makeFrame(payload, e.journalMACKey(), taskID, runID, idx)...)
 	}
 
 	e.closeJournal(taskID, runID)
 	if err := writeFileAtomic(e.journalPath(taskID, runID), buf); err != nil {
 		return fmt.Errorf("durable: compact write %s/%s: %w", taskID, runID, err)
+	}
+	info, ok, err := e.loadMeta(taskID, runID)
+	if err == nil && ok {
+		info.JournalGeneration++
+		if err := e.saveMeta(taskID, runID, info); err != nil {
+			return fmt.Errorf("durable: compact generation %s/%s: %w", taskID, runID, err)
+		}
 	}
 	return nil
 }
@@ -658,9 +838,17 @@ func frameTrailerSize(macKey []byte) int {
 	return frameHMACSize
 }
 
-func journalFrameMAC(macKey, lenPrefix, payload []byte) []byte {
+func journalFrameMAC(macKey []byte, taskID, runID string, index int, lenPrefix, payload []byte) []byte {
 	mac := hmac.New(sha256.New, macKey)
 	_, _ = mac.Write([]byte(journalMACDomain))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(taskID))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(runID))
+	_, _ = mac.Write([]byte{0})
+	var idx [8]byte
+	binary.BigEndian.PutUint64(idx[:], uint64(index))
+	_, _ = mac.Write(idx[:])
 	_, _ = mac.Write(lenPrefix)
 	_, _ = mac.Write(payload)
 	return mac.Sum(nil)
@@ -703,7 +891,14 @@ func unwrapSidecarMAC(macKey []byte, domain, taskID, runID string, raw []byte) (
 	return body, nil
 }
 
-func makeFrame(payload, macKey []byte) []byte {
+// makeFrame builds the on-disk frame. payload must already have passed
+// checkFramePayload — otherwise the uint32 length prefix below cannot
+// describe it and the frame would be unreadable.
+func makeFrame(payload, macKey []byte, taskID, runID string, index int) []byte {
+	if len(payload) > maxFramePayload {
+		panic(fmt.Sprintf("durable: makeFrame called with %d-byte payload past the %d limit; call checkFramePayload first",
+			len(payload), maxFramePayload))
+	}
 	trail := frameTrailerSize(macKey)
 	frame := make([]byte, frameLenSize+len(payload)+trail)
 	binary.BigEndian.PutUint32(frame[0:4], uint32(len(payload)))
@@ -713,50 +908,61 @@ func makeFrame(payload, macKey []byte) []byte {
 		binary.BigEndian.PutUint32(frame[4+len(payload):], checksum)
 		return frame
 	}
-	copy(frame[4+len(payload):], journalFrameMAC(macKey, frame[0:4], payload))
+	copy(frame[4+len(payload):], journalFrameMAC(macKey, taskID, runID, index, frame[0:4], payload))
 	return frame
 }
 
 // readFrame reads one framed JournalEntry and returns it along with the
 // total on-disk size of the frame. It returns io.EOF at a clean end of
-// file, errCorruptFrame for a torn write or CRC mismatch, and errJournalMAC
-// when WithJournalMACKey is set and the HMAC does not match.
-func readFrame(r io.Reader, macKey []byte) (*durablepb.JournalEntry, int64, error) {
+// file, errTruncatedFrame when the file ends mid-frame, errCorruptFrame for
+// a CRC mismatch or an undecodable payload, and errJournalMAC when
+// WithJournalMACKey is set and the HMAC does not match.
+//
+// The size is reported even on a corrupt frame — it is the size the frame
+// claims, from its own length prefix. scanJournal compares that against the
+// remaining file to tell a torn tail from damage in the middle.
+func readFrame(r io.Reader, macKey []byte, taskID, runID string, index int) (*durablepb.JournalEntry, int64, error) {
 	var lenBuf [frameLenSize]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		if errors.Is(err, io.EOF) {
 			return nil, 0, io.EOF
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, 0, errTruncatedFrame
 		}
 		return nil, 0, err
 	}
 	payloadLen := binary.BigEndian.Uint32(lenBuf[:])
+	trail := frameTrailerSize(macKey)
+	claimed := int64(frameLenSize+trail) + int64(payloadLen)
 	if payloadLen > maxFramePayload {
-		return nil, 0, errCorruptFrame
+		// appendFrame rejects oversize payloads, so a prefix this large means
+		// the prefix itself is damaged. claimed is still returned: it is
+		// normally far past EOF, which marks this as garbage at the tail.
+		return nil, claimed, errCorruptFrame
 	}
 
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, 0, errCorruptFrame
+		return nil, claimed, errTruncatedFrame
 	}
 
-	trail := frameTrailerSize(macKey)
 	trailer := make([]byte, trail)
 	if _, err := io.ReadFull(r, trailer); err != nil {
-		return nil, 0, errCorruptFrame
+		return nil, claimed, errTruncatedFrame
 	}
 	if len(macKey) == 0 {
 		storedCRC := binary.BigEndian.Uint32(trailer)
 		if storedCRC != crc32.ChecksumIEEE(payload) {
-			return nil, 0, errCorruptFrame
+			return nil, claimed, errCorruptFrame
 		}
-	} else if !hmac.Equal(trailer, journalFrameMAC(macKey, lenBuf[:], payload)) {
-		return nil, 0, errJournalMAC
+	} else if !hmac.Equal(trailer, journalFrameMAC(macKey, taskID, runID, index, lenBuf[:], payload)) {
+		return nil, claimed, errJournalMAC
 	}
 
 	var entry durablepb.JournalEntry
 	if err := proto.Unmarshal(payload, &entry); err != nil {
-		return nil, 0, errCorruptFrame
+		return nil, claimed, errCorruptFrame
 	}
-	total := int64(frameLenSize+trail) + int64(payloadLen)
-	return &entry, total, nil
+	return &entry, claimed, nil
 }

@@ -3,8 +3,10 @@ package durable
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -19,10 +21,11 @@ type stepTokenTTLKey struct{}
 
 var stepTokenNow = time.Now
 
-// WithStepTokenKey enables HMAC StepToken values used by CompleteStep.
-// Omit it (or pass nil/empty) to keep unsigned tokens with no expiry, the
-// default. The key is copied and never written under dataDir.
-// Ignored by NewReadOnlyEngine.
+// WithStepTokenKey sets the key used to sign StepToken values that
+// CompleteStep accepts. Pass one when tokens must stay valid across a
+// restart: without it NewEngine signs with a per-process random key, so
+// tokens issued before a restart are rejected afterwards. The key is copied
+// and never written under dataDir. Ignored by NewReadOnlyEngine.
 func WithStepTokenKey(key []byte) Option {
 	return func(c *engineConfig, _ *readOnlyConfig) {
 		if c == nil {
@@ -34,6 +37,39 @@ func WithStepTokenKey(key []byte) Option {
 		}
 		c.tokenSecret = append([]byte(nil), key...)
 	}
+}
+
+// WithUnsignedStepTokens opts out of authenticated step tokens: StepToken
+// returns a plain taskID:runID:stepID triple with no signature and no expiry.
+// Anyone who can reach CompleteStep can mint one for any run and step, so use
+// this only where the CompleteStep caller is already authenticated by other
+// means and tokens must survive a restart. WithStepTokenKey gives you both
+// properties and takes precedence over this option. Ignored by
+// NewReadOnlyEngine.
+func WithUnsignedStepTokens() Option {
+	return func(c *engineConfig, _ *readOnlyConfig) {
+		if c != nil {
+			c.unsignedTokens = true
+		}
+	}
+}
+
+// resolveStepTokenKey makes authenticated tokens the default. A step token is
+// a bearer credential: it names the run and step whose result the holder may
+// supply, and CompleteStep writes that result into the journal. Defaulting to
+// unsigned would mean any caller of a webhook or approval endpoint could
+// forge one, so an engine with neither a key nor an explicit opt-out signs
+// with a fresh random key that lives only as long as the process.
+func (c *engineConfig) resolveStepTokenKey() error {
+	if len(c.tokenSecret) > 0 || c.unsignedTokens {
+		return nil
+	}
+	key := make([]byte, sha256.Size)
+	if _, err := rand.Read(key); err != nil {
+		return fmt.Errorf("durable: generate step token key: %w", err)
+	}
+	c.tokenSecret = key
+	return nil
 }
 
 // WithDefaultStepTokenTTL sets how long HMAC StepToken values remain valid.

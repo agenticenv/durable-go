@@ -12,6 +12,7 @@ import (
 	"time"
 
 	durable "github.com/agenticenv/durable-go"
+	"github.com/agenticenv/durable-go/examples/internal/exdir"
 )
 
 type OpenAIClient struct{ Model string }
@@ -100,7 +101,7 @@ func (r *AgentRunner) Exec(ctx context.Context, s *durable.StepRunner, in AgentI
 func main() {
 	ctx := context.Background()
 
-	e, err := durable.NewEngine(ctx, "examples/struct-task/.data/agent-journal",
+	e, err := durable.NewEngine(ctx, exdir.Data("struct-task", "agent-journal"),
 		durable.WithLogger(slog.Default()),
 		durable.WithAutoPurge(24*time.Hour),
 	)

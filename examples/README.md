@@ -9,13 +9,15 @@
 | [`yaml-task/`](./yaml-task/) | YAML | One YAML file = one task; each `steps[].id` is a `RunStep` |
 | [`payload-codec/`](./payload-codec/) | closure | Plaintext vs AES-GCM vs custom codec, HMAC tokens, journal MAC, inspect `--redact` |
 
-From the repo root:
+This directory is its own module. From here:
 
 ```bash
-go run ./examples/resume/
-go run ./examples/func-task/
-go run ./examples/struct-task/
-go run ./examples/fanout/
-go run ./examples/yaml-task/
-go run ./examples/payload-codec/
+go run ./resume/
+go run ./func-task/
+go run ./struct-task/
+go run ./fanout/
+go run ./yaml-task/
+go run ./payload-codec/
 ```
+
+Or `cd` into an example and `go run .`. Journals land under `<name>/.data/` (gitignored). `resume/` uses a temp dir and prints the path.

@@ -1,0 +1,17 @@
+# Extends the built-in rule set. Without this, a local config would
+# replace defaults and miss real secrets.
+title = "durable-go"
+
+[extend]
+useDefault = true
+
+# Sequential hex used only by examples/payload-codec so `go run` needs no
+# real key. generic-api-key matches it in history and on the working tree.
+[allowlist]
+description = "documented demo AES-256 key (00–ff twice), not a production secret"
+paths = [
+    '''examples/payload-codec/main\.go''',
+]
+regexes = [
+    '''00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff''',
+]

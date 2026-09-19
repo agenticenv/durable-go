@@ -33,6 +33,9 @@ examples/**/.data/
 # Optional durable-bench journal dir if someone passes -dir ./benchmarks/.data
 benchmarks/.data/
 
+# go build of package main writes this next to sources
+/benchmarks/benchmarks
+
 # Inspect CLI binary
 /bin/
 

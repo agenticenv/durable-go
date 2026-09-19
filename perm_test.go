@@ -142,6 +142,38 @@ func TestNewEngine_WarnsWhenChmodDoesNotStick(t *testing.T) {
 	}
 }
 
+func TestSweepOrphanRunDirs_RemovesMetaLess(t *testing.T) {
+	dir := t.TempDir()
+	orphan := runDir(dir, "t", "r")
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inputPath(dir, "t", "r"), []byte(`"x"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// no journal.log — the first-start crash window listTasks cannot see
+	sweepOrphanRunDirs(dir, nil)
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan dir still present: %v", err)
+	}
+}
+
+func TestSweepTmpFiles_RemovesStale(t *testing.T) {
+	dir := t.TempDir()
+	run := runDir(dir, "t", "r")
+	if err := os.MkdirAll(run, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(run, "meta.json.tmp")
+	if err := os.WriteFile(tmp, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sweepTmpFiles(dir, nil)
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("tmp still present: %v", err)
+	}
+}
+
 func TestIsGroupOrWorldAccessible(t *testing.T) {
 	if !isGroupOrWorldAccessible(0o755) || !isGroupOrWorldAccessible(0o644) {
 		t.Fatal("expected 0755 and 0644 to be group/world accessible")

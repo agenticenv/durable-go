@@ -327,7 +327,7 @@ func TestRunStep_FailedReplayDoesNotRerunFn(t *testing.T) {
 		})
 	}
 
-	e1, err := durable.NewEngine(ctx, src)
+	e1, err := durable.NewEngine(ctx, src, durable.WithUnsignedStepTokens())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +346,7 @@ func TestRunStep_FailedReplayDoesNotRerunFn(t *testing.T) {
 	}
 	_ = e1.Close()
 
-	e2, err := durable.NewEngine(ctx, dst)
+	e2, err := durable.NewEngine(ctx, dst, durable.WithUnsignedStepTokens())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,6 +530,49 @@ func waitUntil(t *testing.T, timeout time.Duration, pred func() bool) {
 
 func encodeTestToken(taskID, runID, stepID string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(taskID + ":" + runID + ":" + stepID))
+}
+
+// A token is untrusted input — unsigned ones are plain base64 that anyone can
+// mint — so its IDs must not be able to steer file access out of dataDir.
+func TestCompleteStep_RejectsPathTraversalInForgedToken(t *testing.T) {
+	e := newTestEngine(t)
+	for _, tc := range []struct {
+		name          string
+		taskID, runID string
+	}{
+		{"parent in taskID", "../../escape", "r1"},
+		{"parent in runID", "t1", "../../escape"},
+		{"dotdot segment", "..", "r1"},
+		{"separator in taskID", "a/b", "r1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := durable.CompleteStep(context.Background(), e,
+				encodeTestToken(tc.taskID, tc.runID, "wait"), "payload")
+			if !errors.Is(err, durable.ErrInvalidToken) {
+				t.Fatalf("got %v, want ErrInvalidToken", err)
+			}
+		})
+	}
+}
+
+// tokenBox hands a StepToken from the step goroutine to the test goroutine.
+// The step function runs on its own goroutine, so a bare captured string
+// would be an unsynchronised handoff that -race flags.
+type tokenBox struct {
+	mu  sync.Mutex
+	val string
+}
+
+func (b *tokenBox) set(s string) {
+	b.mu.Lock()
+	b.val = s
+	b.mu.Unlock()
+}
+
+func (b *tokenBox) get() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.val
 }
 
 func registerApproval(t *testing.T, e *durable.Engine, calls *atomic.Int32) {
@@ -745,7 +788,7 @@ func TestCompleteStep_CrashRestartReplay(t *testing.T) {
 	ctx := context.Background()
 	var calls atomic.Int32
 
-	e1, err := durable.NewEngine(ctx, src)
+	e1, err := durable.NewEngine(ctx, src, durable.WithUnsignedStepTokens())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -762,7 +805,7 @@ func TestCompleteStep_CrashRestartReplay(t *testing.T) {
 	}
 	_ = e1.Close()
 
-	e2, err := durable.NewEngine(ctx, dst)
+	e2, err := durable.NewEngine(ctx, dst, durable.WithUnsignedStepTokens())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -882,17 +925,18 @@ func TestCompleteStep_TokenWithColonInStepID(t *testing.T) {
 
 func TestCompleteStep_HMACToken(t *testing.T) {
 	e := newTestEngine(t, durable.WithStepTokenKey([]byte("secret")))
-	var token string
+	var box tokenBox
 	if err := durable.RegisterTask(e, "approve", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		return durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
-			token = s.StepToken(ctx)
+			box.set(s.StepToken(ctx))
 			return "", durable.ErrStepPending
 		}).Get(ctx)
 	})); err != nil {
 		t.Fatal(err)
 	}
 	run := durable.RunTask[string, string](context.Background(), e, "approve", "r1", "")
-	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting && token != "" })
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting && box.get() != "" })
+	token := box.get()
 	if !strings.HasPrefix(token, "v1.") {
 		t.Fatalf("expected HMAC token, got %s", token)
 	}
@@ -910,18 +954,18 @@ func TestCompleteStep_HMACToken(t *testing.T) {
 
 func TestCompleteStep_StepTokenTTLOverride(t *testing.T) {
 	e := newTestEngine(t, durable.WithStepTokenKey([]byte("secret")), durable.WithDefaultStepTokenTTL(time.Hour))
-	var token string
+	var box tokenBox
 	if err := durable.RegisterTask(e, "approve", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
 		return durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
-			token = s.StepToken(ctx)
+			box.set(s.StepToken(ctx))
 			return "", durable.ErrStepPending
 		}, durable.WithStepTokenTTL(7*24*time.Hour)).Get(ctx)
 	})); err != nil {
 		t.Fatal(err)
 	}
 	run := durable.RunTask[string, string](context.Background(), e, "approve", "r1", "")
-	waitUntil(t, 2*time.Second, func() bool { return token != "" })
-	if err := durable.CompleteStep(context.Background(), e, token, "yes"); err != nil {
+	waitUntil(t, 2*time.Second, func() bool { return box.get() != "" })
+	if err := durable.CompleteStep(context.Background(), e, box.get(), "yes"); err != nil {
 		t.Fatal(err)
 	}
 	out, err := run.Get(context.Background())

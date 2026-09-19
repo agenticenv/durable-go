@@ -38,6 +38,23 @@ func openFileSecure(path string, flag int) (*os.File, error) {
 	return f, nil
 }
 
+// ensureDataDirPerms sets owner-only modes on dataDir, tasks/, and .lock.
+// The recursive walk of existing files runs only until .perms_ok is written,
+// so later NewEngine calls are O(1) in the number of runs.
+func ensureDataDirPerms(dir string) {
+	chmodBestEffort(dir, dirPerm)
+	tasks := filepath.Join(dir, tasksDirName)
+	chmodBestEffort(tasks, dirPerm)
+	chmodBestEffort(lockPath(dir), filePerm)
+	sentinel := filepath.Join(dir, permsSentinelName)
+	if _, err := os.Stat(sentinel); err == nil {
+		return
+	}
+	tightenDataDir(dir)
+	_ = os.WriteFile(sentinel, []byte("ok\n"), filePerm)
+	chmodBestEffort(sentinel, filePerm)
+}
+
 // tightenDataDir sets owner-only modes on dataDir, tasks/, .lock, and every
 // existing file under tasks/. Chmod failures are ignored (Windows).
 func tightenDataDir(dir string) {
@@ -56,6 +73,57 @@ func tightenDataDir(dir string) {
 		return nil
 	})
 	chmodBestEffort(lockPath(dir), filePerm)
+}
+
+func sweepTmpFiles(dataDir string, logger *slog.Logger) {
+	tasks := filepath.Join(dataDir, tasksDirName)
+	_ = filepath.WalkDir(tasks, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if filepath.Ext(d.Name()) == ".tmp" || len(d.Name()) > 4 && d.Name()[len(d.Name())-4:] == ".tmp" {
+			if err := os.Remove(path); err == nil {
+				orDiscard(logger).Warn("removed stale tmp file", "path", path)
+			}
+		}
+		return nil
+	})
+}
+
+func sweepOrphanRunDirs(dataDir string, logger *slog.Logger) {
+	tasks := filepath.Join(dataDir, tasksDirName)
+	taskEntries, err := os.ReadDir(tasks)
+	if err != nil {
+		return
+	}
+	for _, te := range taskEntries {
+		if !te.IsDir() {
+			continue
+		}
+		runs, err := os.ReadDir(filepath.Join(tasks, te.Name()))
+		if err != nil {
+			continue
+		}
+		for _, re := range runs {
+			if !re.IsDir() {
+				continue
+			}
+			dir := runDir(dataDir, te.Name(), re.Name())
+			if _, err := os.Stat(metaPath(dataDir, te.Name(), re.Name())); err == nil {
+				continue
+			}
+			// A journal without meta is still a real run (lost sidecar).
+			// Only drop the first-start crash window: input.json and no
+			// journal, which listTasks cannot see.
+			if _, err := os.Stat(journalPath(dataDir, te.Name(), re.Name())); err == nil {
+				continue
+			}
+			if err := os.RemoveAll(dir); err == nil {
+				orDiscard(logger).Warn("removed run directory with no meta.json",
+					"task_id", te.Name(), "run_id", re.Name())
+			}
+		}
+	}
 }
 
 func isGroupOrWorldAccessible(mode os.FileMode) bool {

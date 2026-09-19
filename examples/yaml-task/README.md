@@ -7,17 +7,17 @@ Re-running with the same `taskID` and `runID` skips already-completed steps.
 
 ## Run
 
-From the repo root:
+From this directory:
 
 ```bash
-go run ./examples/yaml-task/
+go run .
 ```
 
 Crash after step 2, then resume:
 
 ```bash
-CRASH_AFTER=2 go run ./examples/yaml-task/
-go run ./examples/yaml-task/
+CRASH_AFTER=2 go run .
+go run .
 ```
 
 On the second run, `clone` and `build` replay from the journal; only `test` executes.
@@ -25,5 +25,5 @@ On the second run, `clone` and `build` replay from the journal; only `test` exec
 ## Reset
 
 ```bash
-rm -rf examples/yaml-task/.data/
+rm -rf .data/
 ```

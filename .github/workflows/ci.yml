@@ -21,7 +21,10 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          cache-dependency-path: |
+            go.sum
+            examples/go.sum
+            benchmarks/go.sum
 
       # v2 is built with Go >= 1.26; v1.x binaries refuse modules targeting go 1.26+
       - name: Install golangci-lint

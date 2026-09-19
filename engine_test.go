@@ -35,6 +35,9 @@ func assertPerm(t *testing.T, path string, want os.FileMode) {
 
 func newTestEngine(t *testing.T, opts ...durable.Option) *durable.Engine {
 	t.Helper()
+	// Tests that mint encodeTestToken values need unsigned tokens. HMAC
+	// tests pass WithStepTokenKey, which takes precedence.
+	opts = append([]durable.Option{durable.WithUnsignedStepTokens()}, opts...)
 	e, err := durable.NewEngine(context.Background(), t.TempDir(), opts...)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
@@ -724,5 +727,70 @@ func TestJournalMACKey_RejectSidecarTamper(t *testing.T) {
 	_, err = durable.RunTask[string, string](ctx, e2, "echo", "run-1", "ignored").Get(ctx)
 	if err == nil || !strings.Contains(err.Error(), "file MAC mismatch") {
 		t.Fatalf("got %v, want file MAC mismatch", err)
+	}
+}
+
+func TestRunTask_AfterCloseReturnsErrEngineClosed(t *testing.T) {
+	e := newTestEngine(t)
+	if err := durable.RegisterTask(e, "echo", identityTask()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := durable.RunTask[string, string](context.Background(), e, "echo", "r", "x").Get(context.Background())
+	if !errors.Is(err, durable.ErrEngineClosed) {
+		t.Fatalf("got %v, want ErrEngineClosed", err)
+	}
+}
+
+func TestRunTask_DuplicateInFlightSharesHandle(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := durable.RegisterTask(e, "slow", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "block", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
+			close(started)
+			<-release
+			return in, nil
+		}).Get(ctx)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	first := durable.RunTask[string, string](context.Background(), e, "slow", "shared", "ok")
+	<-started
+	second := durable.RunTask[string, string](context.Background(), e, "slow", "shared", "ignored")
+	if first.RunID() != second.RunID() {
+		t.Fatalf("run IDs %s vs %s", first.RunID(), second.RunID())
+	}
+	close(release)
+	out1, err := first.Get(context.Background())
+	if err != nil || out1 != "ok" {
+		t.Fatalf("first %q %v", out1, err)
+	}
+	out2, err := second.Get(context.Background())
+	if err != nil || out2 != "ok" {
+		t.Fatalf("second %q %v", out2, err)
+	}
+}
+
+func TestNewEngine_DefaultStepTokensAreHMAC(t *testing.T) {
+	e, err := durable.NewEngine(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	if err := durable.RegisterTask(e, "approve", durable.Func(func(ctx context.Context, s *durable.StepRunner, in string) (string, error) {
+		return durable.RunStep(ctx, s, "wait", struct{}{}, func(ctx context.Context, _ struct{}) (string, error) {
+			return "", durable.ErrStepPending
+		}).Get(ctx)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	run := durable.RunTask[string, string](context.Background(), e, "approve", "r1", "")
+	waitUntil(t, 2*time.Second, func() bool { return run.Status() == durable.StatusWaiting })
+	err = durable.CompleteStep(context.Background(), e, encodeTestToken("approve", "r1", "wait"), "nope")
+	if !errors.Is(err, durable.ErrInvalidToken) {
+		t.Fatalf("unsigned token accepted by default HMAC engine: %v", err)
 	}
 }

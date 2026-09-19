@@ -25,11 +25,15 @@ package durable
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -38,12 +42,14 @@ import (
 const (
 	defaultLockTimeout       = 2 * time.Second
 	defaultAutoPurgeInterval = time.Hour
-	permTestFileName         = ".perm_test"
+	maxOpenJournals          = 256
 )
 
 type engineConfig struct {
 	autoPurgeAge      time.Duration
 	autoPurgeInterval time.Duration
+	autoPurgeMaxRuns  int
+	autoPurgeMaxBytes int64
 	maxRetries        int
 	timeout           time.Duration
 	logger            *slog.Logger
@@ -51,6 +57,7 @@ type engineConfig struct {
 	codec             PayloadCodec
 	tokenSecret       []byte
 	tokenTTL          *time.Duration
+	unsignedTokens    bool
 	journalMACKey     []byte
 }
 
@@ -61,9 +68,12 @@ type engineConfig struct {
 type Option func(*engineConfig, *readOnlyConfig)
 
 // WithAutoPurge starts a background goroutine that deletes Completed and
-// Failed runs whose UpdatedAt is older than age. The optional interval
-// controls how often the purger runs; it defaults to one hour. Running and
-// Waiting runs are never purged. Ignored by NewReadOnlyEngine.
+// Failed runs whose UpdatedAt is older than age. One pass runs at
+// NewEngine (so a process that restarts more often than interval still
+// purges). The optional interval controls later ticks; it defaults to one
+// hour. Running and Waiting runs are never purged. Combine with
+// WithAutoPurgeMaxRuns / WithAutoPurgeMaxBytes to cap disk. Ignored by
+// NewReadOnlyEngine.
 func WithAutoPurge(age time.Duration, interval ...time.Duration) Option {
 	return func(c *engineConfig, _ *readOnlyConfig) {
 		if c == nil {
@@ -72,6 +82,30 @@ func WithAutoPurge(age time.Duration, interval ...time.Duration) Option {
 		c.autoPurgeAge = age
 		if len(interval) > 0 {
 			c.autoPurgeInterval = interval[0]
+		}
+	}
+}
+
+// WithAutoPurgeMaxRuns deletes the oldest Completed/Failed runs when the
+// number of those terminal runs exceeds n. Running and Waiting runs are
+// never counted or removed. Zero (default) means no count cap. Starts the
+// purger even when WithAutoPurge is omitted. Ignored by NewReadOnlyEngine.
+func WithAutoPurgeMaxRuns(n int) Option {
+	return func(c *engineConfig, _ *readOnlyConfig) {
+		if c != nil && n > 0 {
+			c.autoPurgeMaxRuns = n
+		}
+	}
+}
+
+// WithAutoPurgeMaxBytes deletes the oldest Completed/Failed runs when
+// terminal-run directories exceed n bytes on disk. Zero (default) means no
+// size cap. Starts the purger even when WithAutoPurge is omitted. Ignored
+// by NewReadOnlyEngine.
+func WithAutoPurgeMaxBytes(n int64) Option {
+	return func(c *engineConfig, _ *readOnlyConfig) {
+		if c != nil && n > 0 {
+			c.autoPurgeMaxBytes = n
 		}
 	}
 }
@@ -129,11 +163,14 @@ func WithLockTimeout(d time.Duration) Option {
 }
 
 // WithJournalMACKey signs journal.log frames and the run sidecar files
-// (input.json, output.json, meta.json) with HMAC-SHA256. Sidecar MACs are
-// bound to taskID/runID so a file cannot be copied between runs. Omit it
-// (or pass nil/empty) to keep CRC32 journal trailers and unsigned JSON
-// sidecars, the default. The key is copied and never written under
-// dataDir. Required on NewReadOnlyEngine to read a MAC-signed tree.
+// (input.json, output.json, meta.json) with HMAC-SHA256. Frame MACs are
+// bound to taskID, runID, and the 1-based frame index (journal v2) so a
+// journal.log cannot be copied between runs or have its frames reordered.
+// Sidecar MACs are bound to taskID/runID. Omit it (or pass nil/empty) to
+// keep CRC32 journal trailers and unsigned JSON sidecars, the default.
+// Enabling a MAC on an existing CRC tree is not a migrate. The key is
+// copied and never written under dataDir. Required on NewReadOnlyEngine
+// to read a MAC-signed tree.
 func WithJournalMACKey(key []byte) Option {
 	return func(e *engineConfig, r *readOnlyConfig) {
 		if len(key) == 0 {
@@ -160,15 +197,26 @@ type Engine struct {
 	lockFile    *flock.Flock
 	registry    map[string]taskEntry
 	mu          sync.RWMutex
-	runLocks    sync.Map // "taskID/runID" → *sync.Mutex, held for a run's whole execution
+	runLocks    sync.Map // "taskID/runID" → *runLock, held for a run's whole execution
 	signalLocks sync.Map // "taskID/runID/stepID" → *sync.Mutex, held only inside CompleteStep and CancelRun
 	openFiles   sync.Map // "taskID/runID" → *journalFile
 	signals     sync.Map // "taskID/runID/stepID" → chan []byte
 	watchers    sync.Map // "taskID/runID" → *stepWatchSet
 	runCancels  sync.Map // "taskID/runID" → *runHandle, present only while the run executes in this process
+	openCount   atomic.Int32
 	stopCh      chan struct{}
+	closed      atomic.Bool
 	runs        sync.WaitGroup // in-flight RunTask executors and auto-purge
 	closeOnce   sync.Once
+}
+
+// runLock is a refcounted mutex with a tombstone so DeleteTaskRun cannot
+// drop the map entry while another goroutine is blocked on the same lock —
+// that would let LoadOrStore hand out a second mutex and two owners.
+type runLock struct {
+	mu      sync.Mutex
+	refs    atomic.Int32
+	deleted atomic.Bool
 }
 
 // cancelSignalID is a reserved SignalEntry ID used by CancelRun to persist a
@@ -205,6 +253,9 @@ func NewEngine(ctx context.Context, dataDir string, opts ...Option) (*Engine, er
 	for _, o := range opts {
 		o(&cfg, nil)
 	}
+	if err := cfg.resolveStepTokenKey(); err != nil {
+		return nil, err
+	}
 
 	absDir, err := filepath.Abs(dataDir)
 	if err != nil {
@@ -212,10 +263,6 @@ func NewEngine(ctx context.Context, dataDir string, opts ...Option) (*Engine, er
 	}
 	if err := mkdirAllSecure(filepath.Join(absDir, tasksDirName)); err != nil {
 		return nil, fmt.Errorf("durable: create dataDir %q: %w", absDir, err)
-	}
-	tightenDataDir(absDir)
-	if err := ensureWritable(absDir); err != nil {
-		return nil, err
 	}
 
 	if err := occupyExclusive(absDir); err != nil {
@@ -228,7 +275,18 @@ func NewEngine(ctx context.Context, dataDir string, opts ...Option) (*Engine, er
 		return nil, err
 	}
 	chmodBestEffort(lockPath(absDir), filePerm)
+
+	// Lock first so a concurrent writer cannot race the chmod walk or the
+	// writable probe. The recursive walk is skipped once .perms_ok exists.
+	ensureDataDirPerms(absDir)
+	if err := ensureWritable(absDir); err != nil {
+		_ = releaseLock(lockFile)
+		releaseOccupancy(absDir, true)
+		return nil, err
+	}
 	warnIfInsecure(absDir, cfg.logger)
+	sweepTmpFiles(absDir, cfg.logger)
+	sweepOrphanRunDirs(absDir, cfg.logger)
 
 	e := &Engine{
 		dataDir:  absDir,
@@ -237,7 +295,7 @@ func NewEngine(ctx context.Context, dataDir string, opts ...Option) (*Engine, er
 		registry: make(map[string]taskEntry),
 		stopCh:   make(chan struct{}),
 	}
-	if e.cfg.autoPurgeAge > 0 {
+	if e.shouldAutoPurge() {
 		e.runs.Add(1)
 		go e.runAutoPurge()
 	}
@@ -246,7 +304,7 @@ func NewEngine(ctx context.Context, dataDir string, opts ...Option) (*Engine, er
 }
 
 func ensureWritable(dir string) error {
-	path := filepath.Join(dir, permTestFileName)
+	path := filepath.Join(dir, fmt.Sprintf(".perm_test.%d", os.Getpid()))
 	f, err := openFileSecure(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return fmt.Errorf("durable: dataDir %q is not writable: %w", dir, err)
@@ -277,7 +335,10 @@ func ensureWritable(dir string) error {
 func (e *Engine) Close() error {
 	var err error
 	e.closeOnce.Do(func() {
+		e.mu.Lock()
+		e.closed.Store(true)
 		close(e.stopCh)
+		e.mu.Unlock()
 		e.runs.Wait()
 		e.closeAllJournals()
 		err = releaseLock(e.lockFile)
@@ -287,11 +348,16 @@ func (e *Engine) Close() error {
 	return err
 }
 
+func (e *Engine) shouldAutoPurge() bool {
+	return e.cfg.autoPurgeAge > 0 || e.cfg.autoPurgeMaxRuns > 0 || e.cfg.autoPurgeMaxBytes > 0
+}
+
 // runAutoPurge is the long-lived goroutine started when WithAutoPurge is set.
 // It exits when stopCh is closed by Close so the process can shut down
 // without leaking the ticker.
 func (e *Engine) runAutoPurge() {
 	defer e.runs.Done()
+	e.runPurgePass()
 	interval := e.cfg.autoPurgeInterval
 	if interval <= 0 {
 		interval = defaultAutoPurgeInterval
@@ -302,62 +368,163 @@ func (e *Engine) runAutoPurge() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := e.purgeOlderThan(e.cfg.autoPurgeAge); err != nil {
-				e.cfg.logger.Error("auto-purge failed", "error", err)
-			}
+			e.runPurgePass()
 		case <-e.stopCh:
 			return
 		}
 	}
 }
 
-// purgeOlderThan deletes only Completed and Failed runs whose UpdatedAt is
-// strictly older than now-age. Running and Waiting runs are skipped even if
-// they look old — they may be blocked on a human approval.
-func (e *Engine) purgeOlderThan(age time.Duration) error {
-	cutoff := time.Now().UTC().Add(-age)
+func (e *Engine) runPurgePass() {
+	if err := e.purge(); err != nil {
+		e.cfg.logger.Error("auto-purge failed", "error", err)
+	}
+}
+
+// purge deletes Completed and Failed runs that are older than autoPurgeAge
+// and, if caps are set, the oldest terminal runs until the remaining
+// terminal-run count and on-disk size are under the configured limits.
+// Running and Waiting runs are never purged. Walks the tree once instead
+// of materialising a fully sorted ListTasks snapshot.
+func (e *Engine) purge() error {
+	age := e.cfg.autoPurgeAge
+	var cutoff time.Time
+	if age > 0 {
+		cutoff = time.Now().UTC().Add(-age)
+	}
 	e.cfg.logger.Debug("auto-purge running", "cutoff", cutoff)
 
-	tasks, err := listTasks(context.Background(), e.dataDir, e.journalMACKey())
+	type termRun struct {
+		info TaskInfo
+		size int64
+	}
+	var terminal []termRun
+	var termBytes int64
+	err := walkRuns(e.dataDir, e.journalMACKey(), func(info TaskInfo, size int64) error {
+		if info.Status != StatusCompleted && info.Status != StatusFailed {
+			return nil
+		}
+		terminal = append(terminal, termRun{info: info, size: size})
+		termBytes += size
+		return nil
+	})
 	if err != nil {
 		return err
 	}
 
+	sort.Slice(terminal, func(i, j int) bool {
+		if !terminal[i].info.UpdatedAt.Equal(terminal[j].info.UpdatedAt) {
+			return terminal[i].info.UpdatedAt.Before(terminal[j].info.UpdatedAt)
+		}
+		return terminal[i].info.RunID < terminal[j].info.RunID
+	})
+
+	remain := len(terminal)
 	var n int
-	for _, t := range tasks {
-		if t.Status != StatusCompleted && t.Status != StatusFailed {
+	for _, t := range terminal {
+		drop := age > 0 && t.info.UpdatedAt.Before(cutoff)
+		if !drop && e.cfg.autoPurgeMaxRuns > 0 && remain > e.cfg.autoPurgeMaxRuns {
+			drop = true
+		}
+		if !drop && e.cfg.autoPurgeMaxBytes > 0 && termBytes > e.cfg.autoPurgeMaxBytes {
+			drop = true
+		}
+		if !drop {
 			continue
 		}
-		if !t.UpdatedAt.Before(cutoff) {
-			continue
-		}
-		if err := e.DeleteTaskRun(context.Background(), t.TaskID, t.RunID); err != nil {
-			if err == ErrRunActive {
+		if err := e.DeleteTaskRun(context.Background(), t.info.TaskID, t.info.RunID); err != nil {
+			if errors.Is(err, ErrRunActive) {
 				continue
 			}
-			e.cfg.logger.Error("auto-purge delete failed", "task_id", t.TaskID, "run_id", t.RunID, "error", err)
+			e.cfg.logger.Error("auto-purge delete failed", "task_id", t.info.TaskID, "run_id", t.info.RunID, "error", err)
 			continue
 		}
 		n++
+		remain--
+		termBytes -= t.size
 	}
 	e.cfg.logger.Info("auto-purge completed", "purged", n, "cutoff", cutoff)
 	return nil
 }
 
-func (e *Engine) lockRun(taskID, runID string) *sync.Mutex {
-	actual, _ := e.runLocks.LoadOrStore(taskID+"/"+runID, &sync.Mutex{})
-	mu := actual.(*sync.Mutex)
-	mu.Lock()
-	return mu
+func (e *Engine) lockRun(taskID, runID string) (*runLock, error) {
+	l, ok := e.acquireRunLock(taskID, runID, false)
+	if !ok {
+		return nil, ErrRunActive
+	}
+	return l, nil
 }
 
-func (e *Engine) tryLockRun(taskID, runID string) (*sync.Mutex, bool) {
-	actual, _ := e.runLocks.LoadOrStore(taskID+"/"+runID, &sync.Mutex{})
-	mu := actual.(*sync.Mutex)
-	if mu.TryLock() {
-		return mu, true
+func (e *Engine) tryLockRun(taskID, runID string) (*runLock, bool) {
+	return e.acquireRunLock(taskID, runID, true)
+}
+
+func (e *Engine) acquireRunLock(taskID, runID string, try bool) (*runLock, bool) {
+	key := taskID + "/" + runID
+	actual, _ := e.runLocks.LoadOrStore(key, &runLock{})
+	l := actual.(*runLock)
+	l.refs.Add(1)
+	if try {
+		if !l.mu.TryLock() {
+			e.releaseRunLockRef(key, l)
+			return nil, false
+		}
+	} else {
+		l.mu.Lock()
 	}
-	return nil, false
+	if l.deleted.Load() {
+		l.mu.Unlock()
+		e.releaseRunLockRef(key, l)
+		return nil, false
+	}
+	return l, true
+}
+
+func (e *Engine) unlockRun(taskID, runID string, l *runLock) {
+	key := taskID + "/" + runID
+	l.mu.Unlock()
+	e.releaseRunLockRef(key, l)
+}
+
+func (e *Engine) markRunDeleted(l *runLock) {
+	l.deleted.Store(true)
+}
+
+func (e *Engine) releaseRunLockRef(key string, l *runLock) {
+	if l.refs.Add(-1) == 0 && l.deleted.Load() {
+		e.runLocks.Delete(key)
+	}
+}
+
+func (e *Engine) dropIdleRunLock(taskID, runID string) {
+	key := taskID + "/" + runID
+	v, ok := e.runLocks.Load(key)
+	if !ok {
+		return
+	}
+	l := v.(*runLock)
+	if l.refs.Load() != 0 {
+		return
+	}
+	if !l.mu.TryLock() {
+		return
+	}
+	if l.refs.Load() != 0 {
+		l.mu.Unlock()
+		return
+	}
+	e.runLocks.Delete(key)
+	l.mu.Unlock()
+}
+
+func (e *Engine) pruneSignalLocks(taskID, runID string) {
+	prefix := taskID + "/" + runID + "/"
+	e.signalLocks.Range(func(k, _ any) bool {
+		if s, ok := k.(string); ok && strings.HasPrefix(s, prefix) {
+			e.signalLocks.Delete(k)
+		}
+		return true
+	})
 }
 
 // lockSignal serialises CompleteStep calls for one (taskID,runID,stepID),
@@ -447,6 +614,13 @@ func (e *Engine) CancelRun(ctx context.Context, taskID, runID string) error {
 	e.cfg.logger.Info("run cancel requested", "task_id", taskID, "run_id", runID)
 	return nil
 }
+
+// log returns the engine logger, never nil. Internal tests construct a bare
+// &Engine{dataDir: ...} with no config, so callers cannot assume one is set.
+func (e *Engine) log() *slog.Logger { return orDiscard(e.cfg.logger) }
+
+// log returns the read-only engine logger, never nil.
+func (r *ReadOnlyEngine) log() *slog.Logger { return orDiscard(r.cfg.logger) }
 
 func (e *Engine) lookupTask(taskID string) (taskEntry, bool) {
 	e.mu.RLock()

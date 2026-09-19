@@ -24,7 +24,7 @@
 - **Step observability** — `GetStep` / `LoadSteps` for current state, `WatchSteps` for a live/historical event stream (including STARTED).
 - **Timeouts and retries** — engine / task / run / step options. Retries default to 0 (opt-in).
 - **Panic recovery** — task and step panics are recorded and returned as errors.
-- **Auto-purge** — optional background cleanup of old completed and failed runs.
+- **Auto-purge** — optional background cleanup of old completed and failed runs (age, max-runs, and max-bytes caps; one pass at startup).
 - **Flexible execution** — tasks as `durable.Func` closures or structs with `Exec`.
 - **Payload privacy** — optional `PayloadCodec` (built-in AES-GCM); owner-only journal modes; inspect `--redact`.
 
@@ -42,7 +42,7 @@ Most durable-execution frameworks require external infrastructure—such as a de
 go get github.com/agenticenv/durable-go@latest
 ```
 
-Go 1.26.5+. No infrastructure required.
+Go 1.26+. No infrastructure required. The library module depends only on `flock`, `ulid`, and protobuf — examples and benchmarks live in their own modules.
 
 ## Quick Start
 
@@ -180,7 +180,9 @@ for _, t := range pending {
 
 `RunTask` writes `input.json` on first start. The same runID reloads it; the input argument is ignored.
 
-`GetStep` and `LoadSteps` return current state — the latest record per step, in-memory-map order (not sorted). `WatchSteps` returns history and live updates instead: every STARTED, WAITING, COMPLETED, and FAILED event in the order it was written, either from the beginning (`fromOffset` 0) or resuming past a previously-seen `Offset` / `ByteOffset`. Cancelling the watch does not stop the run. A watch that falls behind may have events dropped (logged as a warning) rather than blocking the run — reconnect with the last `Offset`/`ByteOffset` you saw to catch up.
+`GetStep` and `LoadSteps` return current state — the latest record per step, in-memory-map order (not sorted). `WatchSteps` returns history and live updates instead: every STARTED, WAITING, COMPLETED, and FAILED event in the order it was written, either from the beginning (`fromOffset` 0) or resuming past a previously-seen `Offset` / `ByteOffset`. Cancelling the watch does not stop the run. A watch that falls behind may have events dropped (logged as a warning) rather than blocking the run — reconnect with the last `Offset`/`ByteOffset` you saw to catch up. Those offsets are valid only while `StepEvent.Generation` is unchanged: `compactJournal` (run at a terminal state) increments `TaskInfo.JournalGeneration` and rewrites the file from index 1.
+
+A `StatusFailed` run is permanently terminal. `RunTask` with the same runID replays the stored error and does not re-execute. Recover by `DeleteTaskRun` (or a new runID). `ListTasksPage` pages the same sorted list as `ListTasks` when `dataDir` holds many runs.
 
 Full example: [`examples/resume/`](examples/resume/).
 
@@ -221,13 +223,13 @@ Runnable examples in [examples/](examples/) — see [examples/README.md](example
 | [`examples/payload-codec/`](examples/payload-codec/) | Plaintext vs AES-GCM vs custom codec, HMAC tokens, journal MAC, inspect flags |
 
 ```bash
-# from repo root
-go run ./examples/resume/
-go run ./examples/func-task/
-go run ./examples/struct-task/
-go run ./examples/fanout/
-go run ./examples/yaml-task/
-go run ./examples/payload-codec/
+cd examples
+go run ./resume/
+go run ./func-task/
+go run ./struct-task/
+go run ./fanout/
+go run ./yaml-task/
+go run ./payload-codec/
 ```
 
 ## Inspect CLI
@@ -270,11 +272,13 @@ func (c kmsCodec) Decode(ciphertext, aad []byte) ([]byte, error) {
 e, err := durable.NewEngine(ctx, "./data", durable.WithPayloadCodec(kmsCodec{client: kms}))
 ```
 
-**File modes.** Unix directories are `0700` and files `0600`. `NewEngine` chmods an existing `dataDir` and warns if group/world bits remain. Windows chmod is best-effort; encryption still helps there.
+**File modes.** Unix directories are `0700` and files `0600`. After the exclusive lock, `NewEngine` chmods `dataDir` / `tasks/` / `.lock` and walks existing files once (until `.perms_ok` is written). It warns if group/world bits remain. Windows chmod is best-effort; encryption still helps there.
 
-**Step tokens.** `CompleteStep` tokens are unsigned with no expiry unless you set `WithStepTokenKey` (HMAC, default 24h TTL). Override with `WithDefaultStepTokenTTL` or per-step `WithStepTokenTTL`. The key is not stored in `dataDir`.
+**Step tokens.** `CompleteStep` tokens are HMAC-signed by default, with a process-ephemeral key and a 24h TTL (`WithDefaultStepTokenTTL`, per-step `WithStepTokenTTL`). Tokens issued before a restart are rejected unless you persist a key with `WithStepTokenKey`. `WithUnsignedStepTokens` opts out — anyone who can call `CompleteStep` can then mint a token for any run. The key is not stored in `dataDir`.
 
-**Journal MAC.** Default frames end in CRC32 (torn-write detection only). `WithJournalMACKey` replaces that trailer with HMAC-SHA256 and also appends a 32-byte HMAC to `input.json`, `output.json`, and `meta.json` (bound to task/run) so those files cannot be rewritten either. The key is not stored in `dataDir`. Inspect reads `DURABLE_JOURNAL_MAC_KEY` (hex first, else raw). Deleting files is still possible.
+**Journal MAC.** Default frames end in CRC32 (torn-write detection only). `WithJournalMACKey` replaces that trailer with HMAC-SHA256 bound to taskID, runID, and the 1-based frame index (journal v2), and also appends a 32-byte HMAC to `input.json`, `output.json`, and `meta.json` (bound to task/run). A copied or reordered `journal.log` fails closed. The key is not stored in `dataDir`. Inspect reads `DURABLE_JOURNAL_MAC_KEY` (hex first, else raw). Deleting files is still possible.
+
+**AES-GCM rotation.** `NewAESGCMCodec` writes the v1 envelope (`version | nonce | sealed`). `NewAESGCMCodecWithKeys` writes v2 (`version | keyID | nonce | sealed`) and can decode current, any previous key, and v1 blobs (treated as key ID 0). Rotate before `AESGCMRekeyAfter` (~2^32) random-nonce seals on one key. A new key ID is not a migrate of an existing plaintext tree — open a second `dataDir` or keep the old key in the read window.
 
 **Same `dataDir`, same options.** One directory, one codec, one journal MAC key (or none). Those options apply to every run in that tree. Do not turn them on later against an existing plaintext/CRC directory — resume and inspect fail closed.
 
@@ -288,7 +292,7 @@ secure, err := durable.NewEngine(ctx, "./data-secure",
 )
 ```
 
-Inspect: one `-d` per directory; set `DURABLE_PAYLOAD_KEY` / `DURABLE_JOURNAL_MAC_KEY` in the environment (not flags). Walkthrough: [`examples/payload-codec/`](examples/payload-codec/). `WithStepTokenKey` does not change the journal; already-issued unsigned tokens are rejected.
+Inspect: one `-d` per directory; set `DURABLE_PAYLOAD_KEY` / `DURABLE_JOURNAL_MAC_KEY` in the environment (not flags). Walkthrough: [`examples/payload-codec/`](examples/payload-codec/). Turning on `WithStepTokenKey` (or the default ephemeral key) rejects already-issued unsigned tokens.
 
 **Inspect.** Set `DURABLE_PAYLOAD_KEY` / `DURABLE_JOURNAL_MAC_KEY` (not flags). `--redact` prints `[redacted]` for INPUT/RESULT even after decrypt. Status, IDs, ERROR, and PANIC stay visible. Details: [`cmd/durable-inspect/README.md`](cmd/durable-inspect/README.md).
 
@@ -313,21 +317,21 @@ Match this table to your app. If your work is one process plus a local journal, 
 
 Persistence is a local `journal.log` append plus `fsync` — no extra server. On a MacBook Pro (M2 Pro, Apple NVMe SSD) that is ~4 ms per append, well under **1%** of a typical LLM call (~1 s). Replay is a file read; `fn` does not run again.
 
-These figures are the **default persist path**: plaintext JSON (no `PayloadCodec` / AES-GCM), unsigned `CompleteStep` tokens (no `WithStepTokenKey`), and CRC32 journal frames (no `WithJournalMACKey`).
+These figures are the **default persist path**: plaintext JSON (no `PayloadCodec` / AES-GCM) and CRC32 journal frames (no `WithJournalMACKey`). They do **not** include HMAC step tokens (the default; `CompleteStep` only) or task-body re-execution.
 
-| Operation | Latency | Memory / op | Allocations |
-| :--- | :--- | :--- | :--- |
-| Journal append+sync | `4.1 ms/op` | `328 B/op` | `7 allocs/op` |
-| Journal replay (100 steps) | `272 µs/op` | `269 KB/op` | `919 allocs/op` |
-| Completed-run recovery | `33 µs/op` | `3.6 KB/op` | `31 allocs/op` |
+| Operation | What is timed | Latency | Memory / op | Allocations |
+| :--- | :--- | :--- | :--- | :--- |
+| Journal append+sync | one `appendStep` + `fsync` | `4.1 ms/op` | `328 B/op` | `7 allocs/op` |
+| `loadJournal` (100 steps) | replay of `journal.log` only — no meta/input load, no `fn` | `272 µs/op` | `269 KB/op` | `919 allocs/op` |
+| Completed-run `Get` | re-read of `output.json` for an already-finished run | `33 µs/op` | `3.6 KB/op` | `31 allocs/op` |
 
-Same machine and ops with **AES-GCM + journal MAC** (`NewAESGCMCodec` AES-256 and `WithJournalMACKey`). Append stays fsync-bound; replay and Get pay decrypt/MAC CPU and extra allocations. `WithStepTokenKey` is not in this table (`CompleteStep` only).
+Same machine and ops with **AES-GCM + journal MAC** (`NewAESGCMCodec` AES-256 and `WithJournalMACKey`). Append stays fsync-bound; `loadJournal` and `Get` pay decrypt/MAC CPU and extra allocations.
 
-| Operation | Latency | Memory / op | Allocations |
-| :--- | :--- | :--- | :--- |
-| Journal append+sync | `4.1 ms/op` | `1140 B/op` | `19 allocs/op` |
-| Journal replay (100 steps) | `337 µs/op` | `450 KB/op` | `1919 allocs/op` |
-| Completed-run recovery | `33 µs/op` | `4.9 KB/op` | `57 allocs/op` |
+| Operation | What is timed | Latency | Memory / op | Allocations |
+| :--- | :--- | :--- | :--- | :--- |
+| Journal append+sync | one `appendStep` + `fsync` | `4.1 ms/op` | `1140 B/op` | `19 allocs/op` |
+| `loadJournal` (100 steps) | replay of `journal.log` only | `337 µs/op` | `450 KB/op` | `1919 allocs/op` |
+| Completed-run `Get` | re-read of `output.json` | `33 µs/op` | `4.9 KB/op` | `57 allocs/op` |
 
 HDD/NFS will differ. Two ways to measure (not the same command):
 
