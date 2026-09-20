@@ -8,7 +8,7 @@
 
 **Lightweight, embeddable durable task execution for Go.**
 
-**durable-go** lets you define typed tasks, run memoized steps, and persist progress so work can resume safely after failures or restarts. Useful for any Go app that needs reliable, resumable workflows without a heavy orchestration framework.
+**durable-go** lets you define typed tasks, run memoized steps, and persist progress so work can resume safely after failures or restarts within a single process. Useful for any Go app that needs reliable, resumable workflows without a heavy orchestration framework or external infrastructure.
 
 > Releases follow [Semantic Versioning](https://semver.org/); see the [latest release](https://github.com/agenticenv/durable-go/releases/latest).
 
