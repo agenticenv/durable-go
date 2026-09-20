@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -42,7 +43,17 @@ func TestIssueDecodeStepToken_HMACRoundTrip(t *testing.T) {
 func TestDecodeStepToken_WrongMAC(t *testing.T) {
 	e := &Engine{cfg: engineConfig{tokenSecret: []byte("secret")}}
 	tok := e.issueStepToken("t", "r", "wait", time.Hour)
-	bad := tok[:len(tok)-2] + "aa"
+	rest := strings.TrimPrefix(tok, hmacTokenPrefix)
+	dot := strings.LastIndexByte(rest, '.')
+	if dot <= 0 {
+		t.Fatalf("token missing MAC: %s", tok)
+	}
+	mac, err := base64.RawURLEncoding.DecodeString(rest[dot+1:])
+	if err != nil || len(mac) == 0 {
+		t.Fatalf("decode MAC: %v token=%s", err, tok)
+	}
+	mac[0] ^= 0xff
+	bad := hmacTokenPrefix + rest[:dot+1] + base64.RawURLEncoding.EncodeToString(mac)
 	if _, _, _, err := e.decodeStepToken(bad); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("got %v, want ErrInvalidToken", err)
 	}
