@@ -10,6 +10,7 @@ import (
 	"hash/crc32"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -118,7 +119,10 @@ func saveMeta(dataDir, taskID, runID string, info TaskInfo, macKey []byte) error
 	if err != nil {
 		return fmt.Errorf("durable: marshal meta %s/%s: %w", taskID, runID, err)
 	}
-	raw = wrapSidecarMAC(macKey, fileMACDomainMeta, taskID, runID, raw)
+	raw, err = wrapSidecarMAC(macKey, fileMACDomainMeta, taskID, runID, raw)
+	if err != nil {
+		return fmt.Errorf("durable: wrap meta mac %s/%s: %w", taskID, runID, err)
+	}
 	if err := writeFileAtomic(metaPath(dataDir, taskID, runID), raw); err != nil {
 		return fmt.Errorf("durable: write meta %s/%s: %w", taskID, runID, err)
 	}
@@ -866,15 +870,18 @@ func sidecarMAC(macKey []byte, domain, taskID, runID string, body []byte) []byte
 	return mac.Sum(nil)
 }
 
-func wrapSidecarMAC(macKey []byte, domain, taskID, runID string, body []byte) []byte {
+func wrapSidecarMAC(macKey []byte, domain, taskID, runID string, body []byte) ([]byte, error) {
 	if len(macKey) == 0 {
-		return body
+		return body, nil
 	}
 	mac := sidecarMAC(macKey, domain, taskID, runID, body)
+	if len(body) > math.MaxInt-len(mac) {
+		return nil, errors.New("durable: sidecar payload too large")
+	}
 	out := make([]byte, len(body)+len(mac))
 	copy(out, body)
 	copy(out[len(body):], mac)
-	return out
+	return out, nil
 }
 
 func unwrapSidecarMAC(macKey []byte, domain, taskID, runID string, raw []byte) ([]byte, error) {
