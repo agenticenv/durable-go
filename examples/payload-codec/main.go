@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,7 +35,12 @@ const (
 type demoPrefixCodec struct{}
 
 func (demoPrefixCodec) Encode(plaintext, _ []byte) ([]byte, error) {
-	out := make([]byte, 0, len(demoPrefix)+len(plaintext))
+	prefixLen := len(demoPrefix)
+	plainLen := len(plaintext)
+	if plainLen > math.MaxInt-prefixLen {
+		return nil, fmt.Errorf("demo codec: payload too large")
+	}
+	out := make([]byte, 0, prefixLen+plainLen)
 	out = append(out, demoPrefix...)
 	out = append(out, plaintext...)
 	return out, nil
