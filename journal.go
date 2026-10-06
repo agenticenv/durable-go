@@ -153,7 +153,10 @@ func saveOutput(dataDir, taskID, runID string, output []byte, c PayloadCodec, ma
 	if err != nil {
 		return err
 	}
-	stored = wrapSidecarMAC(macKey, fileMACDomainOutput, taskID, runID, stored)
+	stored, err = wrapSidecarMAC(macKey, fileMACDomainOutput, taskID, runID, stored)
+	if err != nil {
+		return fmt.Errorf("durable: wrap output mac %s/%s: %w", taskID, runID, err)
+	}
 	if err := writeFileAtomic(outputPath(dataDir, taskID, runID), stored); err != nil {
 		return fmt.Errorf("durable: write output %s/%s: %w", taskID, runID, err)
 	}
@@ -177,7 +180,10 @@ func saveInput(dataDir, taskID, runID string, input []byte, c PayloadCodec, macK
 	if err != nil {
 		return err
 	}
-	stored = wrapSidecarMAC(macKey, fileMACDomainInput, taskID, runID, stored)
+	stored, err = wrapSidecarMAC(macKey, fileMACDomainInput, taskID, runID, stored)
+	if err != nil {
+		return fmt.Errorf("durable: wrap input mac %s/%s: %w", taskID, runID, err)
+	}
 	if err := writeFileAtomic(inputPath(dataDir, taskID, runID), stored); err != nil {
 		return fmt.Errorf("durable: write input %s/%s: %w", taskID, runID, err)
 	}
