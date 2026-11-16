@@ -3,6 +3,7 @@
 # - workflow_dispatch: same + Codecov upload (on-demand coverage report)
 # - Push / merge to main: no workflow (already validated on the PR)
 # Security (gitleaks, govulncheck, CodeQL): see .github/workflows/security.yml
+# Dependabot Go PRs: .github/workflows/dependabot-tidy.yml tidies nested modules
 name: CI
 
 on:

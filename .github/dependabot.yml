@@ -1,6 +1,8 @@
 # Dependabot: weekly PRs for Go modules and GitHub Actions.
 # Groups keep updates to ~1 PR per ecosystem (avoids Actions burn from many PRs).
 # Not an Actions workflow — GitHub opens PRs; those PRs run ci.yml + security.yml.
+# Go module PRs also run dependabot-tidy.yml, which tidies /, /examples, and
+# /benchmarks and pushes so CI and Security rerun on a consistent go.mod.
 version: 2
 updates:
   - package-ecosystem: gomod
