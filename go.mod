@@ -1,6 +1,6 @@
 module github.com/agenticenv/durable-go
 
-go 1.26
+go 1.26.0
 
 toolchain go1.26.5
 
@@ -10,9 +10,9 @@ toolchain go1.26.5
 retract [v0.1.0, v0.1.3]
 
 require (
-	github.com/gofrs/flock v0.13.1
+	github.com/gofrs/flock v0.13.2
 	github.com/oklog/ulid/v2 v2.1.2
 	google.golang.org/protobuf v1.36.12
 )
 
-require golang.org/x/sys v0.47.0 // indirect
+require golang.org/x/sys v0.49.0 // indirect
